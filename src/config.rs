@@ -1,0 +1,156 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use std::{
+    collections::HashMap,
+    fs,
+    fs::*,
+    io::*,
+    sync::{
+        LazyLock, Mutex,
+        mpsc::{self, Sender},
+    },
+    time::Duration,
+};
+#[derive(Deserialize)]
+struct SettingInfo {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    #[serde(rename = "defaultValue")]
+    default_value: serde_json::Value,
+    // null only hides the setting's row
+    #[serde(default)]
+    performance: Option<Value>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Config {
+    data: HashMap<String, Value>,
+    // value a setting takes while performanceMode is on, the stored one stays untouched
+    #[serde(skip)]
+    performance: HashMap<String, Value>,
+}
+
+fn settings_info() -> HashMap<String, SettingInfo> {
+    serde_json::from_str(include_str!("./cSettings.json")).unwrap_or_else(|_| HashMap::new())
+}
+
+pub fn defaults() -> serde_json::Map<String, Value> {
+    settings_info().into_iter().map(|(key, info)| (key, info.default_value)).collect()
+}
+
+pub fn setting_name(key: &str) -> Option<String> {
+    settings_info().remove(key).map(|info| info.name).filter(|name| !name.is_empty())
+}
+
+impl Config {
+    pub fn load() -> Config {
+        fn load_defaults() -> HashMap<String, Value> {
+            settings_info().into_iter().map(|(key, info)| (key, info.default_value)).collect()
+        }
+        let settings_path = crate::utils::settings_dir().join("settings.json");
+        let defaults = load_defaults();
+
+        if let Some(parent) = std::path::Path::new(&settings_path).parent() {
+            fs::create_dir_all(parent).expect("Failed to create settings directory");
+        }
+
+        let mut settings_file = OpenOptions::new().write(true).read(true).create(true).truncate(false).open(&settings_path).unwrap();
+
+        if settings_file.metadata().unwrap().len() == 0 {
+            settings_file.write_all(serde_json::to_string_pretty(&defaults).unwrap().as_bytes()).ok();
+        }
+
+        let mut settings_string = String::new();
+        settings_file.seek(SeekFrom::Start(0)).ok();
+        settings_file.read_to_string(&mut settings_string).ok();
+
+        let mut data = match serde_json::from_str(&settings_string) {
+            Ok(data) => data,
+            Err(e) => {
+                println!("Error: {}", e);
+                load_defaults()
+            }
+        };
+
+        for (key, default_value) in defaults {
+            data.entry(key).or_insert(default_value);
+        }
+
+        let performance = settings_info().into_iter().filter_map(|(key, info)| Some((key, info.performance?))).collect();
+        Config { data, performance }.migrate_menu_throttle()
+    }
+
+    // old inMenuThrottle default 1.5 -> 1. runs once, only touches the old default
+    fn migrate_menu_throttle(mut self) -> Config {
+        if self.get::<bool>("menuThrottleMigrated").unwrap_or(false) {
+            return self;
+        }
+        self.set("menuThrottleMigrated", true);
+        if self.get::<f64>("inMenuThrottle") == Some(1.5) {
+            self.set("inMenuThrottle", 1.0);
+        }
+        self.save();
+        self
+    }
+
+    pub fn get<T: serde::de::DeserializeOwned>(&self, setting: &str) -> Option<T> {
+        if let Some(value) = crate::modules::recovery::setting(setting) {
+            return serde_json::from_value(value).ok();
+        }
+        let overridden = self
+            .performance
+            .get(setting)
+            .filter(|_| self.data.get("performanceMode") == Some(&Value::Bool(true)));
+        overridden.or_else(|| self.data.get(setting)).and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
+    pub fn set<T: serde::Serialize>(&mut self, setting: &str, value: T) {
+        if let Ok(value) = serde_json::to_value(value) {
+            self.data.insert(setting.to_string(), value);
+        }
+    }
+
+    pub fn save(&self) {
+        let Ok(settings_string) = serde_json::to_string_pretty(&self.data) else {
+            return;
+        };
+        write_settings(&settings_string);
+    }
+}
+
+// delayed save and exit save can race
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+// temp file + rename so a crash never leaves half a file
+fn write_settings(text: &str) {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let settings_path = crate::utils::settings_dir().join("settings.json");
+    let temp_path = settings_path.with_extension("json.tmp");
+    if fs::write(&temp_path, text).is_ok() {
+        fs::rename(&temp_path, &settings_path).ok();
+    }
+}
+
+static SAVER: LazyLock<Sender<()>> = LazyLock::new(|| {
+    let (sender, receiver) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        while receiver.recv().is_ok() {
+            while receiver.recv_timeout(Duration::from_secs(1)).is_ok() {}
+            let Ok(settings_string) = serde_json::to_string_pretty(&crate::CONFIG.lock().unwrap().data) else {
+                continue;
+            };
+            write_settings(&settings_string);
+        }
+    });
+    sender
+});
+
+pub fn save_soon() {
+    // bench never writes settings
+    if crate::modules::bench::config().is_some() {
+        return;
+    }
+    SAVER.send(()).ok();
+}

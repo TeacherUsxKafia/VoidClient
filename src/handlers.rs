@@ -1,0 +1,1078 @@
+use crate::{app, bridge, constants, debug_print, modules, utils, utils::config, window};
+use cef::{rc::*, *};
+use std::sync::{LazyLock, Mutex, mpsc};
+
+#[cfg(windows)]
+type OsKeyEvent = sys::MSG;
+#[cfg(target_os = "linux")]
+type OsKeyEvent = sys::XEvent;
+
+// args from a second instance while the main window gets recreated
+static PENDING_ARGS: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn set_pending_args(args: String) {
+    *PENDING_ARGS.lock().unwrap() = Some(args);
+}
+
+pub fn parse_web_message_value(value: &str) -> serde_json::Value {
+    if let Ok(bool_val) = value.parse::<bool>() {
+        serde_json::Value::Bool(bool_val)
+    } else if let Ok(int_val) = value.parse::<i64>() {
+        serde_json::Value::Number(serde_json::Number::from(int_val))
+    } else if let Ok(float_val) = value.parse::<f64>() {
+        serde_json::Value::Number(serde_json::Number::from_f64((float_val * 100.0).round() / 100.0).unwrap())
+    } else {
+        serde_json::Value::String(value.to_string())
+    }
+}
+
+fn request_url(request: Option<&mut Request>) -> Option<String> {
+    let request = request?;
+    Some(utils::cef_to_string(&request.url()))
+}
+
+// load hook runs on IO, this hops to UI
+wrap_task! {
+    struct GameUpdatedTask {
+        browser_id: i32,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            if let Some(browser) = window::browser_by_id(self.browser_id) {
+                bridge::post_string(&browser, "game-updated");
+            }
+        }
+    }
+}
+
+wrap_task! {
+    struct HotkeyTask {
+        browser_id: i32,
+        action: modules::hotkeys::Action,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            if let Some(browser) = window::browser_by_id(self.browser_id) {
+                window::handle_accelerator_key(&browser, self.action);
+            }
+        }
+    }
+}
+
+// loads a mod page in the main window after on_before_popup returned
+wrap_task! {
+    struct LoadInMainTask {
+        url: String,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            window::load_in_main(&self.url);
+        }
+    }
+}
+
+wrap_resource_request_handler! {
+    struct VoidResourceRequestHandler;
+
+    impl ResourceRequestHandler {
+        fn on_before_resource_load(
+            &self,
+            browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            _callback: Option<&mut Callback>,
+        ) -> ReturnValue {
+            let Some(url) = request_url(request) else { return ReturnValue::CONTINUE };
+
+            if url.contains("krunker.io") && (url.contains("game-info") || url.contains("lobby-ranked")) {
+                if let Some(browser) = browser {
+                    let mut task = GameUpdatedTask::new(browser.identifier());
+                    post_task(ThreadId::UI, Some(&mut task));
+                }
+                return ReturnValue::CONTINUE;
+            }
+
+            // a file the player swapped in beats our blocklist (muzflash.png, ambient sounds, cats)
+            if modules::blocklist::is_blocked(&url)
+                && !modules::blocklist::wants_empty_model(&url)
+                && !modules::swapper::has_swap(&url)
+            {
+                debug_print!("handlers: blocked {url}");
+                return ReturnValue::CANCEL;
+            }
+            ReturnValue::CONTINUE
+        }
+
+        fn resource_handler(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+        ) -> Option<ResourceHandler> {
+            let url = request_url(request)?;
+            if modules::bench::active() && url.contains(modules::bench::BENCH_PATH) {
+                return modules::resource::serve("text/html", modules::bench::STUB_PAGE.as_bytes().to_vec());
+            }
+            // player's swapper beats our own swaps
+            if let Some(bytes) = modules::swapper::swap_for(&url) {
+                debug_print!("handlers: swapping {url}");
+                let filename = utils::krunker_path(&url).unwrap_or("");
+                return modules::resource::serve(modules::swapper::mime_for(filename), bytes.to_vec());
+            }
+            if modules::blocklist::wants_empty_model(&url) {
+                debug_print!("handlers: empty model for {url}");
+                return modules::resource::serve("text/plain", modules::blocklist::EMPTY_MODEL.as_bytes().to_vec());
+            }
+            None
+        }
+
+    }
+}
+
+wrap_request_handler! {
+    struct VoidRequestHandler;
+
+    impl RequestHandler {
+        fn on_before_browse(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _request: Option<&mut Request>,
+            _user_gesture: ::std::os::raw::c_int,
+            _is_redirect: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            // before the page asks for its files, so a swap dropped into the folder applies on a plain reload
+            if let (Some(browser), Some(frame)) = (browser, frame)
+                && browser.is_popup() == 0
+                && frame.is_main() != 0
+            {
+                modules::swapper::rescan();
+            }
+            0
+        }
+
+        fn resource_request_handler(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _request: Option<&mut Request>,
+            _is_navigation: ::std::os::raw::c_int,
+            _is_download: ::std::os::raw::c_int,
+            _request_initiator: Option<&CefString>,
+            _disable_default_handling: Option<&mut ::std::os::raw::c_int>,
+        ) -> Option<ResourceRequestHandler> {
+            Some(VoidResourceRequestHandler::new())
+        }
+
+        fn on_render_process_terminated(
+            &self,
+            _browser: Option<&mut Browser>,
+            status: TerminationStatus,
+            error_code: ::std::os::raw::c_int,
+            error_string: Option<&CefString>,
+        ) {
+            let text = format!("renderer ended: {status:?} code {error_code} {}", utils::cef_str(error_string));
+            debug_print!("{text}");
+            modules::eventlog::push("host", &text);
+            // a kill is void closing it or the player in the task manager, everything else died on its own
+            if status.get_raw() != TerminationStatus::PROCESS_WAS_KILLED.get_raw() {
+                modules::recovery::renderer_crashed();
+            }
+        }
+    }
+}
+
+// requests without a browser (service worker) only pass through here
+wrap_request_context_handler! {
+    pub struct VoidRequestContextHandler;
+
+    impl RequestContextHandler {
+        // chrome style never stores a grant from the permission handler, without this enumerateDevices hides
+        // every mic name and krunker's voice chat shows "Unknown device"
+        fn on_request_context_initialized(&self, request_context: Option<&mut RequestContext>) {
+            if let Some(context) = request_context {
+                let url = CefString::from("https://krunker.io/");
+                context.set_content_setting(Some(&url), Some(&url), ContentSettingTypes::MEDIASTREAM_MIC, ContentSettingValues::ALLOW);
+            }
+        }
+
+        fn resource_request_handler(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _request: Option<&mut Request>,
+            _is_navigation: ::std::os::raw::c_int,
+            _is_download: ::std::os::raw::c_int,
+            _request_initiator: Option<&CefString>,
+            _disable_default_handling: Option<&mut ::std::os::raw::c_int>,
+        ) -> Option<ResourceRequestHandler> {
+            Some(VoidResourceRequestHandler::new())
+        }
+    }
+}
+
+// page still gets the key
+wrap_keyboard_handler! {
+    struct VoidKeyboardHandler;
+
+    impl KeyboardHandler {
+        fn on_pre_key_event(
+            &self,
+            browser: Option<&mut Browser>,
+            event: Option<&KeyEvent>,
+            _os_event: Option<&mut OsKeyEvent>,
+            _is_keyboard_shortcut: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            let (Some(browser), Some(event)) = (browser, event) else { return 0 };
+            if event.type_ != KeyEventType::RAWKEYDOWN {
+                return 0;
+            }
+            // after the key: a resize closes a focused popup (color picker), chromium then sends the key into the freed widget
+            if let Some(action) = crate::modules::hotkeys::action_for(event.windows_key_code, event.modifiers) {
+                let mut task = HotkeyTask::new(browser.identifier(), action);
+                post_task(ThreadId::UI, Some(&mut task));
+            }
+            0
+        }
+    }
+}
+
+// chrome/app/chrome_command_ids.h
+const IDC_CLOSE_WINDOW: ::std::os::raw::c_int = 34012;
+
+wrap_command_handler! {
+    struct VoidCommandHandler;
+
+    impl CommandHandler {
+        fn on_chrome_command(
+            &self,
+            browser: Option<&mut Browser>,
+            command_id: ::std::os::raw::c_int,
+            _disposition: WindowOpenDisposition,
+        ) -> ::std::os::raw::c_int {
+            // alt+f4 is a chrome accelerator in a chrome style browser, it never reaches our window as WM_SYSCOMMAND
+            if command_id == IDC_CLOSE_WINDOW
+                && let Some(browser) = browser
+            {
+                window::close_window(browser);
+            }
+            1
+        }
+    }
+}
+
+wrap_permission_handler! {
+    struct VoidPermissionHandler;
+
+    impl PermissionHandler {
+        fn on_request_media_access_permission(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _requesting_origin: Option<&CefString>,
+            requested_permissions: u32,
+            callback: Option<&mut MediaAccessCallback>,
+        ) -> ::std::os::raw::c_int {
+            let Some(callback) = callback else { return 0 };
+            callback.cont(requested_permissions);
+            1
+        }
+
+        fn on_show_permission_prompt(
+            &self,
+            _browser: Option<&mut Browser>,
+            _prompt_id: u64,
+            _requesting_origin: Option<&CefString>,
+            _requested_permissions: u32,
+            callback: Option<&mut PermissionPromptCallback>,
+        ) -> ::std::os::raw::c_int {
+            let Some(callback) = callback else { return 0 };
+            callback.cont(PermissionRequestResult::ACCEPT);
+            1
+        }
+    }
+}
+
+wrap_context_menu_handler! {
+    struct VoidContextMenuHandler;
+
+    impl ContextMenuHandler {
+        fn on_before_context_menu(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _params: Option<&mut ContextMenuParams>,
+            model: Option<&mut MenuModel>,
+        ) {
+            if let Some(model) = model {
+                model.clear();
+            }
+        }
+    }
+}
+
+wrap_download_handler! {
+    struct VoidDownloadHandler;
+
+    impl DownloadHandler {
+        fn can_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            _url: Option<&CefString>,
+            _request_method: Option<&CefString>,
+        ) -> ::std::os::raw::c_int {
+            1
+        }
+
+        fn on_before_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            _download_item: Option<&mut DownloadItem>,
+            suggested_name: Option<&CefString>,
+            callback: Option<&mut BeforeDownloadCallback>,
+        ) -> ::std::os::raw::c_int {
+            let Some(callback) = callback else { return 0 };
+            // an empty path makes cef write into temp
+            let suggested = suggested_name.map(|name| name.to_string()).unwrap_or_default();
+            let target = crate::utils::download_target(&suggested);
+            debug_print!("download: {} -> {}", suggested, target.display());
+            callback.cont(Some(&CefString::from(target.to_string_lossy().as_ref())), 0);
+            1
+        }
+    }
+}
+
+// only called for alloy style browsers, ours are chrome style so drops still reach the managers
+wrap_drag_handler! {
+    struct VoidDragHandler;
+
+    impl DragHandler {
+        fn on_drag_enter(
+            &self,
+            _browser: Option<&mut Browser>,
+            _drag_data: Option<&mut DragData>,
+            _mask: DragOperationsMask,
+        ) -> ::std::os::raw::c_int {
+            1
+        }
+    }
+}
+
+wrap_display_handler! {
+    struct VoidDisplayHandler;
+
+    impl DisplayHandler {
+        fn on_console_message(
+            &self,
+            _browser: Option<&mut Browser>,
+            level: LogSeverity,
+            message: Option<&CefString>,
+            source: Option<&CefString>,
+            line: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            debug_print!("console: {} ({}:{line})", utils::cef_str(message), utils::cef_str(source));
+            if level == LogSeverity::WARNING || level == LogSeverity::ERROR || level == LogSeverity::FATAL {
+                let source = utils::cef_str(source);
+                let file = source.split(['?', '#']).next().unwrap_or_default().rsplit('/').next().unwrap_or_default();
+                let kind = if level == LogSeverity::WARNING { "warn" } else { "error" };
+                let at = if file.is_empty() { String::new() } else { format!(" ({file}:{line})") };
+                modules::eventlog::push(kind, &format!("{}{at}", utils::cef_str(message)));
+            }
+            0
+        }
+    }
+}
+
+wrap_life_span_handler! {
+    struct VoidLifeSpanHandler;
+
+    impl LifeSpanHandler {
+        fn on_before_popup(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _popup_id: ::std::os::raw::c_int,
+            _target_url: Option<&CefString>,
+            _target_frame_name: Option<&CefString>,
+            _target_disposition: WindowOpenDisposition,
+            _user_gesture: ::std::os::raw::c_int,
+            popup_features: Option<&PopupFeatures>,
+            window_info: Option<&mut WindowInfo>,
+            client: Option<&mut Option<Client>>,
+            settings: Option<&mut BrowserSettings>,
+            _extra_info: Option<&mut Option<DictionaryValue>>,
+            _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            let url = utils::cef_str(_target_url);
+            debug_print!("handlers: popup requested for {url}");
+            // mod "Use" button, a second game window would kick the first one (one session per account)
+            if window::is_mod_page(&url) && window::has_main_browser() {
+                let mut task = LoadInMainTask::new(url);
+                post_task(ThreadId::UI, Some(&mut task));
+                return 1;
+            }
+            window::create_popup_window(popup_features, window_info, client, settings);
+            0
+        }
+
+        fn on_after_created(&self, browser: Option<&mut Browser>) {
+            let Some(browser) = browser else { return };
+            window::attach_browser(browser);
+            if browser.is_popup() != 0 {
+                // same origin popups keep the V8 context and swap the document, so register per document
+                if config("userscripts", true) {
+                    // one per script so a syntax error doesn't kill the rest
+                    for script in modules::userscripts::social_document_scripts() {
+                        let source =
+                            format!("if (window === window.top && location.href.includes(\"krunker.io/social.html\")) {{\n{script}\n}}");
+                        modules::devtools::add_document_script(browser, &source);
+                    }
+                }
+                return;
+            }
+            if let Some(args) = PENDING_ARGS.lock().unwrap().take() {
+                let string = serde_json::to_string(&args).unwrap_or_else(|_| String::new());
+                bridge::post_json(browser, &format!("{{\"args\":{}}}", string));
+            }
+        }
+
+        fn do_close(&self, browser: Option<&mut Browser>) -> ::std::os::raw::c_int {
+            if let Some(browser) = browser {
+                window::mark_closing(browser);
+            }
+            0
+        }
+
+        fn on_before_close(&self, browser: Option<&mut Browser>) {
+            if let Some(browser) = browser {
+                window::detach_browser(browser);
+            }
+        }
+    }
+}
+
+wrap_client! {
+    pub struct VoidClient;
+
+    impl Client {
+        fn command_handler(&self) -> Option<CommandHandler> {
+            Some(VoidCommandHandler::new())
+        }
+
+        fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
+            Some(VoidContextMenuHandler::new())
+        }
+
+        fn display_handler(&self) -> Option<DisplayHandler> {
+            Some(VoidDisplayHandler::new())
+        }
+
+        fn download_handler(&self) -> Option<DownloadHandler> {
+            Some(VoidDownloadHandler::new())
+        }
+
+        fn drag_handler(&self) -> Option<DragHandler> {
+            Some(VoidDragHandler::new())
+        }
+
+        fn permission_handler(&self) -> Option<PermissionHandler> {
+            Some(VoidPermissionHandler::new())
+        }
+
+        fn keyboard_handler(&self) -> Option<KeyboardHandler> {
+            Some(VoidKeyboardHandler::new())
+        }
+
+        fn life_span_handler(&self) -> Option<LifeSpanHandler> {
+            Some(VoidLifeSpanHandler::new())
+        }
+
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(VoidRequestHandler::new())
+        }
+
+        fn on_process_message_received(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _source_process: ProcessId,
+            message: Option<&mut ProcessMessage>,
+        ) -> ::std::os::raw::c_int {
+            let (Some(browser), Some(frame), Some(message)) = (browser, frame, message) else { return 0 };
+            if utils::cef_to_string(&message.name()) != constants::MSG_FROM_PAGE {
+                return 0;
+            }
+            // main frame of the main browser only, like WebView2
+            if frame.is_main() == 0 || browser.is_popup() != 0 {
+                return 1;
+            }
+            let Some(args) = message.argument_list() else { return 1 };
+            let text = utils::cef_to_string(&args.string(0));
+            handle_web_message(browser, frame, &text);
+            1
+        }
+    }
+}
+
+
+// the keyring may ask for its password and wait minutes for it, never on the ui thread
+#[cfg(target_os = "linux")]
+fn handle_accounts_message(browser: &Browser, message: &str) {
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    let browser_id = browser.identifier();
+    let message = message.to_string();
+    std::thread::spawn(move || {
+        let _store = ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reply = accounts_command(&message, |script| {
+            let mut task = EvaluateTask::new(browser_id, script);
+            post_task(ThreadId::UI, Some(&mut task));
+        });
+        if let Some(reply) = reply {
+            bridge::post_json_later(browser_id, reply);
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+wrap_task! {
+    struct EvaluateTask {
+        browser_id: i32,
+        expression: String,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            if let Some(browser) = window::browser_by_id(self.browser_id) {
+                modules::devtools::evaluate(&browser, &self.expression);
+            }
+        }
+    }
+}
+
+
+// manager commands write files, a non krunker page could plant a userscript
+fn is_krunker_frame(frame: &Frame) -> bool {
+    let url = utils::cef_to_string(&frame.url());
+    url.starts_with("https://") && utils::krunker_path(&url).is_some()
+}
+
+fn payload_str<'a>(payload: &'a serde_json::Value, key: &str) -> &'a str {
+    payload[key].as_str().unwrap_or_default()
+}
+
+// one worker thread for manager file IO: keeps disk off the UI thread and swapper reloads in order
+static MANAGER_QUEUE: LazyLock<Option<mpsc::Sender<(i32, String)>>> = LazyLock::new(|| {
+    let (sender, receiver) = mpsc::channel::<(i32, String)>();
+    std::thread::Builder::new()
+        .name("void-managers".into())
+        .spawn(move || {
+            for (browser_id, message) in receiver {
+                let reply = match message.split_once('-') {
+                    // after the writes queued before it, the renderer reads the scripts from disk
+                    Some(("scripts", rest)) if rest.starts_with("load ") => {
+                        bridge::load_scripts_later(browser_id, rest["load ".len()..].to_string());
+                        None
+                    }
+                    Some(("scripts", rest)) => handle_scripts_message(rest),
+                    Some(("swapper", rest)) => handle_swapper_message(rest),
+                    Some(("css", rest)) => handle_css_message(rest),
+                    _ => None,
+                };
+                if let Some(reply) = reply {
+                    bridge::post_json_later(browser_id, reply);
+                }
+            }
+        })
+        .ok()
+        .map(|_| sender)
+});
+
+fn queue_manager_message(browser: &Browser, message: &str) {
+    if let Some(queue) = MANAGER_QUEUE.as_ref() {
+        queue.send((browser.identifier(), message.to_string())).ok();
+    }
+}
+
+fn manager_reply(key: &str, list: serde_json::Value, problems: &[String]) -> Option<String> {
+    let mut reply = serde_json::json!({ key: list });
+    if !problems.is_empty() {
+        reply["managerError"] = serde_json::json!(problems.join("\n"));
+    }
+    Some(reply.to_string())
+}
+
+fn handle_scripts_message(message: &str) -> Option<String> {
+    use modules::userscripts;
+    let (command, payload) = message.split_once(' ').unwrap_or((message, "{}"));
+    let payload = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    let key = payload_str(&payload, "key");
+    let mut problems: Vec<String> = Vec::new();
+    match command {
+        "list" => {}
+        "read" => {
+            return Some(serde_json::json!({ "userscriptSource": { "key": key, "content": userscripts::read(key) } }).to_string());
+        }
+        "write" => {
+            let result = userscripts::write(payload_str(&payload, "group"), payload_str(&payload, "file"), payload_str(&payload, "content"));
+            problems.extend(result.err());
+            // bulk import asks for the list once at the end
+            if payload["noList"].as_bool() == Some(true) {
+                return (!problems.is_empty()).then(|| serde_json::json!({ "managerError": problems.join("\n") }).to_string());
+            }
+        }
+        "toggle" => userscripts::set_enabled(key, payload["enabled"].as_bool().unwrap_or(true)),
+        "prefs" => {
+            userscripts::set_prefs(key, payload["prefs"].clone());
+            return None;
+        }
+        "delete" => problems.extend(userscripts::delete(key).err()),
+        "move" => problems.extend(userscripts::move_to(key, payload_str(&payload, "group")).err()),
+        "reveal" => {
+            userscripts::reveal(if key.is_empty() { None } else { Some(key) });
+            return None;
+        }
+        _ => return None,
+    }
+    manager_reply("userscripts", userscripts::list(), &problems)
+}
+
+fn handle_swapper_message(message: &str) -> Option<String> {
+    use modules::swapper;
+    let (command, payload) = message.split_once(' ').unwrap_or((message, "{}"));
+    let payload = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    let path = payload_str(&payload, "path");
+    let mut problems: Vec<String> = Vec::new();
+    match command {
+        // picks up files added through explorer
+        "list" => swapper::reload(),
+        "mkdir" => problems.extend(swapper::make_dir(path).err()),
+        "delete" => problems.extend(swapper::delete(path).err()),
+        "move" => problems.extend(swapper::move_to(payload_str(&payload, "from"), payload_str(&payload, "to")).err()),
+        // one base64 file at a time, page waits for the ack before sending the next
+        "upload" => {
+            let result = swapper::upload(path, payload_str(&payload, "data"));
+            let error = result.err().map(|e| format!("{path}: {e}"));
+            return Some(serde_json::json!({ "swapperUploaded": { "path": path, "error": error } }).to_string());
+        }
+        "reveal" => {
+            swapper::reveal(path);
+            return None;
+        }
+        "read" => {
+            return Some(serde_json::json!({ "swapperSource": { "path": path, "content": swapper::read_text(path) } }).to_string());
+        }
+        "write" => {
+            let result = swapper::write_text(path, payload_str(&payload, "content"));
+            let error = result.err().map(|e| format!("{path}: {e}"));
+            return Some(serde_json::json!({ "swapper": swapper::list(), "swapperWritten": { "path": path, "error": error } }).to_string());
+        }
+        _ => return None,
+    }
+    manager_reply("swapper", swapper::list(), &problems)
+}
+
+fn handle_css_message(message: &str) -> Option<String> {
+    use modules::custom_css;
+    let (command, payload) = message.split_once(' ').unwrap_or((message, "{}"));
+    let payload = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    match command {
+        "read" => Some(serde_json::json!({ "customCss": { "content": custom_css::read() } }).to_string()),
+        "write" => {
+            let error = custom_css::write(payload_str(&payload, "content")).err();
+            Some(serde_json::json!({ "customCssSaved": { "error": error } }).to_string())
+        }
+        "reveal" => {
+            let name = payload_str(&payload, "name");
+            custom_css::reveal((!name.is_empty()).then_some(name));
+            None
+        }
+        "list" => manager_reply("cssFiles", custom_css::list(), &[]),
+        "get" => {
+            let name = payload_str(&payload, "name");
+            Some(serde_json::json!({ "cssFile": { "name": name, "content": custom_css::read_file(name) } }).to_string())
+        }
+        "save" => {
+            let name = payload_str(&payload, "name");
+            let error = custom_css::write_file(name, payload_str(&payload, "content")).err();
+            Some(serde_json::json!({ "cssFiles": custom_css::list(), "cssSaved": { "name": name, "error": error } }).to_string())
+        }
+        // new, pasted and imported files, never over an existing one
+        "import" => {
+            let requested = payload_str(&payload, "name");
+            let name = custom_css::free_name(requested);
+            let error = custom_css::write_file(&name, payload_str(&payload, "content")).err();
+            let reply = serde_json::json!({ "requested": requested, "name": name, "error": error });
+            Some(serde_json::json!({ "cssFiles": custom_css::list(), "cssImported": reply }).to_string())
+        }
+        "rename" => {
+            let problems: Vec<String> = custom_css::rename(payload_str(&payload, "from"), payload_str(&payload, "to"))
+                .err()
+                .into_iter()
+                .collect();
+            manager_reply("cssFiles", custom_css::list(), &problems)
+        }
+        "delete" => {
+            let problems: Vec<String> = custom_css::delete(payload_str(&payload, "name")).err().into_iter().collect();
+            manager_reply("cssFiles", custom_css::list(), &problems)
+        }
+        "activate" => {
+            let name = payload_str(&payload, "name");
+            let error = custom_css::set_active(name).err();
+            let content = custom_css::read();
+            Some(serde_json::json!({ "cssFiles": custom_css::list(), "cssActivated": { "content": content, "error": error } }).to_string())
+        }
+        _ => None,
+    }
+}
+
+pub fn open_documents_subpath(target: &str) {
+    let path_to_open = match target {
+        "blocklist" => utils::settings_dir().join("user_blocklist.json"),
+        "swapper" => utils::settings_dir().join("swapper"),
+        "userscripts" => modules::userscripts::scripts_dir(),
+        "css" => {
+            let dir = modules::custom_css::css_dir();
+            std::fs::create_dir_all(&dir).ok();
+            dir
+        }
+        _ => return,
+    };
+    #[cfg(windows)]
+    std::process::Command::new("explorer.exe").arg(path_to_open).spawn().ok();
+    #[cfg(target_os = "linux")]
+    crate::linux::sys::open(path_to_open);
+}
+
+pub fn open_in_default_browser(url: &str) {
+    let allowed = constants::OPEN_URL_ALLOWED
+        .iter()
+        .any(|prefix| url.starts_with(prefix) || url == prefix.trim_end_matches('/'));
+    if !allowed || url.chars().any(|c| c.is_whitespace() || c == '"') {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    crate::linux::sys::open(url);
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+        let url = windows::core::HSTRING::from(url);
+        unsafe {
+            ShellExecuteW(None, windows::core::w!("open"), &url, None, None, SW_SHOWNORMAL);
+        }
+    }
+}
+
+pub fn handle_web_message(browser: &Browser, frame: &Frame, message_string: &str) {
+    // swapper uploads are whole files, only log the start
+    if message_string.len() > 300 {
+        let cut = (0..=300).rev().find(|&index| message_string.is_char_boundary(index)).unwrap_or(0);
+        debug_print!("web message: {}... ({} bytes)", &message_string[..cut], message_string.len());
+    } else {
+        debug_print!("web message: {message_string}");
+    }
+    // set-config can't carry objects (matchmaker filter)
+    if let Some(rest) = message_string.strip_prefix("set-config-json ") {
+        if let Some((setting, value)) = rest.split_once(' ')
+            && value.len() <= 16 * 1024
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(value)
+        {
+            crate::CONFIG.lock().unwrap().set(setting, value);
+            crate::config::save_soon();
+            if setting == "hotkeys" {
+                crate::modules::hotkeys::reload();
+            }
+        }
+        return;
+    }
+    if let Some(rest) = message_string.strip_prefix("scripts-") {
+        if is_krunker_frame(frame) && rest.len() <= 5 * 1024 * 1024 {
+            queue_manager_message(browser, message_string);
+        }
+        return;
+    }
+    if let Some(rest) = message_string.strip_prefix("swapper-") {
+        // uploads carry a whole base64 file
+        if is_krunker_frame(frame) && rest.len() <= 48 * 1024 * 1024 {
+            queue_manager_message(browser, message_string);
+        }
+        return;
+    }
+    if let Some(rest) = message_string.strip_prefix("css-") {
+        if is_krunker_frame(frame) && rest.len() <= 8 * 1024 * 1024 {
+            queue_manager_message(browser, message_string);
+        }
+        return;
+    }
+    // reads a whole sound file, off the ui thread
+    if message_string.starts_with("sound-") {
+        if is_krunker_frame(frame) && message_string.len() <= 4096 {
+            queue_manager_message(browser, message_string);
+        }
+        return;
+    }
+    // json carries ", ", and the page part can be large (auto-detect state)
+    if let Some(rest) = message_string.strip_prefix("diagnostics-collect ") {
+        if is_krunker_frame(frame) {
+            let hwnd = window::root_hwnd(browser).unwrap_or_default();
+            modules::diagnostics::collect(browser.identifier(), modules::specs::collect(hwnd), rest.to_string());
+        }
+        return;
+    }
+    if let Some(rest) = message_string.strip_prefix("diagnostics-save ") {
+        if is_krunker_frame(frame) {
+            modules::diagnostics::save(browser.identifier(), rest);
+        }
+        return;
+    }
+    if let Some(command) = message_string.strip_prefix("recovery-") {
+        if is_krunker_frame(frame) {
+            modules::recovery::command(command);
+        }
+        return;
+    }
+    if message_string == "bench-sample-start" {
+        // settle phase over, drop what the hook collected so far
+        if modules::bench::config().is_some_and(|bench| bench.hook) {
+            app::take_present_intervals();
+        }
+        modules::bench::sample_start();
+        return;
+    }
+    if let Some(result) = message_string.strip_prefix("bench-finish ") {
+        modules::bench::finish(result);
+        return;
+    }
+    if let Some(payload) = message_string.strip_prefix("run-bench-matrix ") {
+        // "<run id> [configs]", or only "[configs]" from a bundle older than run ids
+        let (run, configs) = match payload.split_once(' ') {
+            Some((run, configs)) if !payload.starts_with('[') => (run.parse().unwrap_or(0), configs),
+            _ => (0, payload),
+        };
+        // ends up on a command line, whitelist the chars
+        let configs: Vec<String> = serde_json::from_str(configs).unwrap_or_default();
+        let harmless = |config: &String| config.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '=' | ',' | '.'));
+        if !modules::bench::active() && configs.len() <= 8 && configs.iter().all(harmless) {
+            modules::bench::run_matrix(browser, run, configs);
+        }
+        return;
+    }
+    if message_string == "bench-cancel" {
+        modules::bench::cancel_matrix();
+        return;
+    }
+    if let Some(cap) = message_string.strip_prefix("bench-cap ") {
+        modules::bench::set_cap(cap.parse().unwrap_or(0));
+        return;
+    }
+    let parts: Vec<&str> = message_string.split(", ").map(|s| s.trim()).collect();
+
+    match parts.as_slice() {
+        ["set-config", setting, value] => {
+            crate::CONFIG.lock().unwrap().set(setting, parse_web_message_value(value));
+            crate::config::save_soon();
+
+            if *setting == "disableCats" {
+                modules::blocklist::set_cats_off(*value == "true");
+            }
+            if *setting == "laptopPowerBoost" {
+                if *value == "true" {
+                    modules::power::boost()
+                } else {
+                    modules::power::restore()
+                }
+            }
+            if *setting == "swapper" {
+                queue_manager_message(browser, "swapper-list");
+            }
+            // overrides disableCats and swapper, the stored values stay
+            if *setting == "performanceMode" {
+                modules::blocklist::set_cats_off(config("disableCats", true));
+                queue_manager_message(browser, "swapper-list");
+            }
+            // present hook paces the game loop, gameFpsLimit.js has the fallback
+            if *setting == "gameFpsLimit"
+                && let Ok(fps_limit) = value.parse::<u64>()
+            {
+                app::set_target_fps(fps_limit);
+            }
+        }
+        ["obs-plugin", value] => {
+            let install = value.parse::<bool>().unwrap_or(false);
+            modules::obs::set_plugin_installed(frame, install);
+            if !install {
+                crate::CONFIG.lock().unwrap().set("obsCapturePlugin", false);
+                crate::config::save_soon();
+            }
+        }
+        ["get-info"] => {
+            // auto-detect mutes the browser for its test match, a page that died mid run would leave it muted
+            if let Some(host) = browser.host() {
+                host.set_audio_muted(0);
+            }
+            bridge::send_info(frame);
+            // the bundle runs on the game page: what the crash tests count as loaded, krunker's own menu may take minutes
+            if is_krunker_frame(frame) {
+                modules::recovery::milestone("loaded");
+            }
+        }
+        ["mute", value] => {
+            if let Some(host) = browser.host() {
+                host.set_audio_muted(value.parse::<bool>().unwrap_or(false).into());
+            }
+        }
+        // dev badge proof, the token never leaves this process
+        ["dev-proof", nonce, game, hash] => {
+            let sane = nonce.len() <= 64 && game.len() <= 32 && hash.len() == 32;
+            let (nonce, game, hash) = (nonce.to_string(), game.to_string(), hash.to_string());
+            let answer = move || {
+                let proof = if sane { modules::dev::proof(&nonce, &game, &hash) } else { None };
+                match proof {
+                    Some((user, proof)) => serde_json::json!({ "devProof": { "nonce": nonce, "user": user, "proof": proof } }),
+                    None => serde_json::json!({ "devProof": { "nonce": nonce } }),
+                }
+                .to_string()
+            };
+            #[cfg(windows)]
+            bridge::post_json(browser, &answer());
+            // the token decrypts through the keyring, which may ask for its password first
+            #[cfg(target_os = "linux")]
+            {
+                let browser_id = browser.identifier();
+                std::thread::spawn(move || bridge::post_json_later(browser_id, answer()));
+            }
+        }
+        ["drag", value] => {
+            // true = menu open, pointer free
+            let value = value.parse::<bool>().unwrap_or(false);
+            modules::input::set_pointer_locked(!value);
+            if !value {
+                modules::recovery::milestone("match");
+            }
+        }
+        ["left-click-f20", value] => {
+            // false: shoot is bound to the player's own key, a locked left click stays a mouse button
+            modules::input::set_left_click_f20(value.parse::<bool>().unwrap_or(true));
+        }
+        ["wheel-to-page", value] => {
+            modules::input::set_wheel_to_page(value.parse::<bool>().unwrap_or(false));
+        }
+        ["throttle", status] => {
+            // "off" is used by auto-detect
+            let rate = match *status {
+                "off" => 1.0,
+                "game" => config("throttle", 1.0),
+                _ => config("inMenuThrottle", 1.0),
+            };
+            modules::devtools::set_cpu_throttling(browser, rate);
+        }
+        ["get-specs"] => {
+            let hwnd = window::root_hwnd(browser).unwrap_or_default();
+            bridge::post_json(browser, &serde_json::json!({ "specs": modules::specs::collect(hwnd) }).to_string());
+        }
+        // the pc's load since the previous call, for the auto-detect report. the counters block some ms
+        ["load-sample"] => {
+            let browser_id = browser.identifier();
+            std::thread::spawn(move || {
+                bridge::post_json_later(browser_id, serde_json::json!({ "loadSample": modules::load::sample() }).to_string());
+            });
+        }
+        // swap chain fps, 0 without the hook
+        ["get-present"] => {
+            let fps = app::render_stats().map(|(fps, _)| fps).unwrap_or(0);
+            bridge::post_json(browser, &format!("{{\"presentFps\":{fps}}}"));
+        }
+        ["get-present-intervals"] => {
+            // blocks up to 150 ms, off the UI thread
+            #[cfg(windows)]
+            let hook = config("hardFlip", true);
+            // patch 10, always on
+            #[cfg(target_os = "linux")]
+            let hook = true;
+            let browser_id = browser.identifier();
+            std::thread::spawn(move || {
+                let intervals = if hook { app::take_present_intervals() } else { None };
+                let reply = match intervals {
+                    Some((p50, p99, max, arrive_p99, samples)) => serde_json::json!({ "presentIntervals": {
+                    "p50": p50 as f64 / 1e6, "p99": p99 as f64 / 1e6, "max": max as f64 / 1e6, "arriveP99": arrive_p99 as f64 / 1e6, "samples": samples,
+                } }),
+                    None => serde_json::json!({ "presentIntervals": false }),
+                };
+                bridge::post_json_later(browser_id, reply.to_string());
+            });
+        }
+        ["click", x, y] => {
+            if let (Ok(x), Ok(y)) = (x.parse(), y.parse()) {
+                modules::devtools::click(browser, x, y);
+            }
+        }
+        // auto-detect's input script for one sample, see replay.rs
+        ["input-replay", ms] => {
+            if let (Ok(ms), Some(hwnd)) = (ms.parse(), window::root_hwnd(browser)) {
+                modules::replay::start(hwnd, browser.identifier(), ms);
+            }
+        }
+        ["input-replay-stop"] => {
+            modules::replay::stop();
+        }
+        ["close"] => {
+            window::close_all();
+        }
+        // proves the native crash filter writes its files, dev builds only
+        #[cfg(feature = "verbose-logs")]
+        ["crash-test"] => unsafe {
+            std::ptr::write_volatile(std::ptr::without_provenance_mut::<u8>(1), 1);
+        },
+        ["restart"] => {
+            modules::lifecycle::restart();
+        }
+        // the AppImage updater, linuxUpdate.js
+        #[cfg(target_os = "linux")]
+        ["update-state"] => {
+            modules::updater::send_state(browser);
+        }
+        #[cfg(target_os = "linux")]
+        ["update-install"] => {
+            modules::updater::install();
+        }
+        #[cfg(target_os = "linux")]
+        ["update-restart"] => {
+            modules::updater::restart();
+        }
+        #[cfg(target_os = "linux")]
+        ["update-page"] => {
+            open_in_default_browser(constants::RELEASE_PAGE_URL);
+        }
+        ["bring-to-front"] => {
+            window::bring_to_front(browser);
+        }
+        // shows changed icons. never use clear-cache for that, it wipes all krunker settings
+        ["hard-reload"] => {
+            browser.reload_ignore_cache();
+        }
+        ["clear-cache"] => {
+            modules::devtools::clear_cache(browser);
+        }
+        ["open", target] => {
+            open_documents_subpath(target);
+        }
+        ["open-url", url] => {
+            open_in_default_browser(url);
+        }
+        // linux: the page swallowed a wheel tick while locked (rampBoost.js), windows never sends this
+        #[cfg(target_os = "linux")]
+        ["ramp-wheel", direction] => {
+            modules::input::ramp_wheel(browser, direction.parse::<i32>().unwrap_or(0) > 0);
+        }
+        ["toggle-rboost", value] => {
+            let value = value.parse::<bool>().unwrap_or(false);
+            modules::input::set_rampboost(value);
+        }
+        ["hotkeys-pause", value] => {
+            modules::hotkeys::pause(value.parse::<bool>().unwrap_or(false));
+        }
+        _ => {}
+    }
+}

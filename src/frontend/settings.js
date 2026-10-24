@@ -1,0 +1,443 @@
+import cSettings from "../cSettings.json";
+import { voidClient, globalRef } from "./client.js";
+import { getElement, getInput, checkCompMode } from "./utils.js";
+import { hiddenByPerformance, overridePerformance } from "./performance.js";
+import { setRampBoost } from "./modules/rampBoost.js";
+
+/**
+ * a cSettings.json entry
+ *
+ * @typedef {object} SettingOption
+ * @property {string} id
+ * @property {string} name "{{version}}" is replaced with the client version
+ * @property {string} type "checkbox", "slider", "select" or "none"
+ * @property {string} category
+ * @property {string|number|boolean} [defaultValue] Absent for button-only settings
+ * @property {string} [description]
+ * @property {boolean} [needsRestart]
+ * @property {boolean} [needsRefresh]
+ * @property {string} [button]
+ * @property {string} [buttonAction] Inline JS; "{{voidClient}}" is replaced with a reference to the client object
+ * @property {boolean} [requiresLogin] The button and the checkbox are disabled while no account is logged in
+ * @property {string} [requires] id of a checkbox setting this one depends on, disabled while that is off
+ * @property {string} [disabledBy] id of a checkbox setting that forces this one off while on, the stored value stays
+ * @property {string} [hostFeature] hostFeatures entry the exe must list, the setting is not shown without it
+ * @property {string[]} [platforms] Only shown on these ("windows", "linux"), an exe that reports no platform is windows
+ * @property {boolean|null} [performance] Value while performance mode is on, the row is hidden then. null only hides it
+ * @property {number} [min]
+ * @property {number} [max]
+ * @property {number} [step]
+ * @property {string[]} [options]
+ * @property {string} [html] Rendered control, filled in by SettingsManager
+ */
+
+/** @type {Map<string, number>} */
+const debounceTimers = new Map();
+
+const BLOCKED_STYLE = "opacity: 0.35; cursor: not-allowed";
+
+// inside the onclick of krunker's own raw mouse switch, see lockRawMouse
+const RAW_MOUSE_SETTING = "window.setSetting(\"rawMouse\"";
+const RAW_MOUSE_HINT = "Controlled by Void Client's Raw Input setting";
+const RAW_MOUSE_HINT_LINUX = "Not available on Linux";
+
+const settings = /** @type {Record<string, SettingOption>} */ (cSettings);
+
+
+/**
+ * @param {string} id
+ * @return {`toggle${string}`}
+ */
+function toggleName(id){
+    return `toggle${id.charAt(0).toUpperCase() + id.slice(1)}`;
+}
+
+/**
+ * @param {SettingOption} option
+ * @return {SettingOption|null} the setting that currently forces this one off
+ */
+function blockerOf(option){
+    const blocker = option.disabledBy ? settings[option.disabledBy] : null;
+    return blocker && voidClient.settings.data[blocker.id] === true ? blocker : null;
+}
+
+/**
+ * @param {string} id
+ * @param {boolean} on
+ */
+function switchModule(id, on){
+    const toggle = voidClient.settings[toggleName(id)];
+    if (typeof toggle === "function"){
+        toggle(on);
+        return;
+    }
+    if (!on) return;
+    // esbuild's glob import throws right away for a setting without a module file
+    try {
+        import(`./modules/${id}.js`).catch(() => {});
+    }
+    catch {
+        // no module for this setting
+    }
+}
+
+/**
+ * Settings without a module of their own.
+ *
+ * @param {string} id
+ * @param {string|number|boolean} value
+ */
+function applyInterface(id, value){
+    switch (id){
+        case "exitButton":
+            getElement("#clientExit").style.display = `${value ? "flex" : "none"}`;
+            break;
+        default:
+            break;
+    }
+}
+
+/**
+ * Shows the settings that `id` blocks as off (or their stored value again) and switches their modules to match.
+ *
+ * @param {string} id
+ * @param {boolean} blocking
+ */
+function applyBlocker(id, blocking){
+    for (const dependent of Object.values(settings)){
+        if (dependent.disabledBy !== id) continue;
+        const on = !blocking && Boolean(voidClient.settings.data[dependent.id]);
+
+        const input = document.querySelector(`#${dependent.id}`);
+        if (input instanceof HTMLInputElement){
+            input.checked = on;
+            input.disabled = blocking;
+            const label = input.closest("label");
+            if (label){
+                label.style.cssText = blocking ? BLOCKED_STYLE : "";
+                label.title = blocking ? `Off while ${settings[id].name} is on` : "";
+            }
+        }
+
+        switchModule(dependent.id, on);
+    }
+}
+
+/**
+ * @param {string} id
+ * @param {string|number|boolean} rawValue
+ * @param {boolean} slider from a range input, gets debounced
+ */
+voidClient.settings.changeSetting = (id, rawValue, slider) => {
+    if (rawValue === "") return;
+
+    // a hotkey can flip a setting while the settings window is closed
+    const input = document.querySelector(`#${id}`);
+    if (input instanceof HTMLInputElement){
+        input.value = String(rawValue);
+        if (input.type === "checkbox") input.checked = rawValue === true;
+    }
+    let value = rawValue;
+
+    if (typeof value === "string"){
+        const numberRegex = /^-?\d*\.?\d+$/;
+        if (numberRegex.test(value)){
+            if (value.includes(".")) value = Number.parseFloat(value);
+            else value = Number.parseInt(value, 10);
+        }
+    }
+
+    const sliderInput = /** @type {HTMLInputElement|null} */ (document.querySelector(`#slid_input_${id}`));
+    if (sliderInput && slider){
+        sliderInput.value = String(value);
+
+        clearTimeout(debounceTimers.get(id));
+
+        debounceTimers.set(id, setTimeout(() => {
+            voidClient.settings.data[id] = value;
+            window.chrome.webview.postMessage(`set-config, ${id}, ${value}`);
+
+            debounceTimers.delete(id);
+        }, 500));
+        return;
+    }
+
+    switch (id){
+        case "obsCapturePlugin":
+            if (
+                value &&
+                // eslint-disable-next-line no-alert
+                !confirm(
+                    "Install the Void Client Capture plugin into OBS? OBS must be closed, and Windows may ask for administrator permission.",
+                )
+            ){
+                getInput("#obsCapturePlugin").checked = false;
+                return;
+            }
+            window.chrome.webview.postMessage(`obs-plugin, ${value}`);
+            break;
+        case "rampBoost":
+            if (value){
+                if (!checkCompMode()) setRampBoost(true);
+            }
+            else setRampBoost(false);
+            break;
+        default:
+            applyInterface(id, value);
+            break;
+    }
+
+    const toggleFunctionName = toggleName(id);
+    if (typeof voidClient.settings[toggleFunctionName] !== "function"){
+        try {
+            import(`./modules/${id}.js`).catch(() => {});
+        }
+        catch {
+            // no module for this setting
+        }
+    }
+    else {
+        voidClient.settings[toggleFunctionName](value);
+    }
+
+    voidClient.settings.data[id] = value;
+    window.chrome.webview.postMessage(`set-config, ${id}, ${value}`);
+    applyBlocker(id, value === true);
+};
+
+const REFRESH_MARK = ' <span style="color: #3244a8" title="Requires Refresh">*</span>';
+const RESTART_MARK = ' <span style="color: #eb5656" title="Requires Restart">*</span>';
+
+/**
+ * [label, material icon, color class, inline action]
+ *
+ * @return {[string, string, string, string][]}
+ */
+const topButtons = () => {
+    /**
+     * @param {string} url must be under OPEN_URL_ALLOWED (constants.rs), the host drops anything else
+     * @return {string}
+     */
+    const openUrl = (url) => `window.chrome.webview.postMessage('open-url, ${url}')`;
+    return [
+        ["Manage Swapper", "swap_horiz", "voidTopOrange", `${globalRef}.swapperManager.open()`],
+        ["Manage Userscripts", "extension", "voidTopOrange", `${globalRef}.userscriptManager.open()`],
+        ["CSS Folder", "palette", "voidTopOrange", "window.chrome.webview.postMessage('open, css')"],
+    ];
+};
+
+class SettingsManager {
+    constructor(){
+        /** @type {any} krunker's settings window */
+        this.settingsWindow = window.windows[0];
+        this.init();
+    }
+    init(){
+        const origGetSettings = this.settingsWindow.getSettings;
+        /**
+         * @param {...any} args
+         * @return {string}
+         */
+        this.settingsWindow.getSettings = (...args) => {
+            const original = this.lockRawMouse(origGetSettings.call(this.settingsWindow, ...args));
+            const ours = this.getCSettings();
+            if (!ours) return original;
+            // our settings go inside krunker's first closing div, so move that closer behind them
+            const closesFirst = original.startsWith("</div>");
+            return (closesFirst ? original.slice("</div>".length) : original) + ours + (closesFirst ? "</div>" : "");
+        };
+
+        this.settingsWindow.getCSettings = () => this.getCSettings();
+        voidClient.settings.togglePerformanceMode = (enabled) => {
+            for (const id of overridePerformance(voidClient.settings.data, enabled)){
+                const value = voidClient.settings.data[id];
+                applyInterface(id, value);
+                switchModule(id, value === true && !blockerOf(settings[id]));
+            }
+            // changeSetting stores the new value after this returns, the rows render from it
+            setTimeout(() => this.rerender(), 0);
+        };
+        voidClient.openVoidSettings = () => {
+            window.showWindow(1);
+            this.settingsWindow.changeTab(this.settingsWindow.tabs[this.settingsWindow.settingType].length - 1);
+        };
+        window.chrome.webview.addEventListener("message", (event) => {
+            const response = event.data;
+            if (response?.type !== "obs-plugin") return;
+            if (!response.ok){
+                voidClient.settings.data.obsCapturePlugin = false;
+                const checkbox = /** @type {HTMLInputElement|null} */ (document.querySelector("#obsCapturePlugin"));
+                if (checkbox) checkbox.checked = false;
+            }
+            voidClient.showNotification(response.message, false, 5);
+        });
+    }
+
+    rerender(){
+        const tabs = this.settingsWindow.tabs[this.settingsWindow.settingType];
+        if (this.settingsWindow.tabIndex === tabs.length - 1 || this.settingsWindow.settingSearch) this.settingsWindow.changeTab(this.settingsWindow.tabIndex);
+    }
+
+    /**
+     * Locks krunker's own "Raw Mouse Input" switch to ours. Both ask for the same pointer lock flag and main.js
+     * always passes our value, so theirs can never do anything: it is shown with our state and greyed out
+     * instead of looking like a second, working control. Their stored setting is never written.
+     *
+     * @param {string} html krunker's generated settings markup
+     * @return {string}
+     */
+    lockRawMouse(html){
+        const anchor = html.indexOf(RAW_MOUSE_SETTING);
+        if (anchor < 0) return html;
+        const tagStart = html.lastIndexOf("<input", anchor);
+        const tagEnd = html.indexOf(">", anchor);
+        const label = html.lastIndexOf("<label", anchor);
+        if (tagStart < 0 || tagEnd < 0 || label < 0) return html;
+        const labelEnd = html.indexOf(">", label);
+        // the label has to be the one around this input, otherwise the markup is not what we expect any more
+        if (labelEnd < 0 || labelEnd > tagStart) return html;
+        const input = html.slice(tagStart, tagEnd).replace(/\s+checked\b/, "")
+            + (voidClient.settings.data.rawInput && voidClient.platform !== "linux" ? " checked" : "") + " disabled>";
+        // the tooltip goes on the label: a disabled input takes no pointer events, so the hover lands there
+        const hint = voidClient.platform === "linux" ? RAW_MOUSE_HINT_LINUX : RAW_MOUSE_HINT;
+        return html.slice(0, labelEnd) + ` title="${hint}">`
+            + html.slice(labelEnd + 1, tagStart) + input + html.slice(tagEnd + 1);
+    }
+
+    /**
+     * @param {SettingOption} setting
+     * @return {boolean}
+     */
+    searchMatches(setting){
+        const query = this.settingsWindow.settingSearch.toLowerCase() || "";
+        return [setting.name, setting.category, setting.description ?? ""].some((text) => text.toLowerCase().includes(query));
+    }
+
+    /**
+     * @param {SettingOption} option
+     * @return {string}
+     */
+    generateHtml(option){
+        const value = voidClient.settings.data[option.id];
+        // globalRef has double quotes, would end the onclick attribute
+        const buttonAction = option.buttonAction?.replaceAll("{{voidClient}}", globalRef).replaceAll('"', "&quot;") ?? "";
+        const locked = option.requiresLogin && document.querySelector("#signedInHeaderBar") === null;
+        let button = "";
+        // krunker's row buttons sit flush right (width auto, no margin). next to a switch the button floats left of
+        // it and keeps the 8 px krunker's .settingsBtn has between two of its own
+        const gap = option.type === "checkbox" ? "margin-right: 8px; " : "";
+        if (option.button && locked){
+            button = `<div class="settingsBtn" style="${gap}width: auto; opacity: 0.35; cursor: not-allowed" title="Log in first">${option.button}</div>`;
+        }
+        else if (option.button){
+            button = `<div class="settingsBtn" style="${gap}width: auto" onclick="${buttonAction}">${option.button}</div>`;
+        }
+        switch (option.type){
+            case "checkbox": {
+                const blocker = blockerOf(option);
+                if (blocker){
+                    return `<label class='switch' style="${BLOCKED_STYLE}" title="Off while ${blocker.name} is on">
+                        <input id="${option.id}" type='checkbox' disabled
+                            onclick='${globalRef}.settings.changeSetting("${option.id}", this.checked, false)'>
+                        <span class='slider'></span>
+                    </label>
+                    ${button}`;
+                }
+                if (locked){
+                    return `<label class='switch' style="${BLOCKED_STYLE}" title="Log in first">
+                        <input id="${option.id}" type='checkbox' disabled ${value ? "checked" : ""}>
+                        <span class='slider'></span>
+                    </label>
+                    ${button}`;
+                }
+                const required = option.requires ? settings[option.requires] : null;
+                if (required && voidClient.settings.data[required.id] === false){
+                    return `<label class='switch' style="${BLOCKED_STYLE}" title="Needs ${required.name}, which is off">
+                        <input id="${option.id}" type='checkbox' disabled ${value ? "checked" : ""}>
+                        <span class='slider'></span>
+                    </label>
+                    ${button}`;
+                }
+                return `<label class='switch'>
+                    <input id="${option.id}" type='checkbox'
+                        onclick='${globalRef}.settings.changeSetting("${option.id}", this.checked, false)'
+                        ${value ? "checked" : ""}>
+                    <span class='slider'></span>
+                </label>
+                ${button}`;
+            }
+            case "slider":
+                return `<input type="number" class="sliderVal" id="slid_input_${option.id}" min="${option.min}" value="${value || option.min}"
+                    step="${option.step}" oninput='${globalRef}.settings.changeSetting("${option.id}", this.value, true)' style="margin-right:0px;border-width:0px">
+                <div class="slidecontainer" style="margin-top: -8px;"><input type="range" id="${option.id}" min="${option.min}" max="${option.max}"
+                    step="${option.step}" value="${value}" class="sliderM" oninput='${globalRef}.settings.changeSetting("${option.id}", this.value, true)'></div>`;
+            case "select":
+                return `<select id="${option.id}" class="inputGrey2" onchange='${globalRef}.settings.changeSetting("${option.id}", this.value, false)'>
+                    ${(option.options ?? []).map((opt) => `<option value="${opt}" ${opt === value ? "selected" : ""}>${opt}</option>`).join("")}</select>`;
+            case "none":
+                return button;
+            default:
+                return "";
+        }
+    }
+
+    /**
+     * @return {string}
+     */
+    getCSettings(){
+        if (
+            // our tab is the last one in basic mode too
+            this.settingsWindow.tabs[this.settingsWindow.settingType].length !== this.settingsWindow.tabIndex + 1 &&
+            !this.settingsWindow.settingSearch
+        ){
+            return "";
+        }
+
+        let tempHTML = "<div class='voidSettings'>";
+        if (!this.settingsWindow.settingSearch){
+            tempHTML += `<div class="voidTopButtons">${topButtons()
+                .map(([label, icon, color, action]) => `<div class="voidTopButton ${color}" onclick="${action.replaceAll('"', "&quot;")}">
+                    ${label}<span class="material-icons">${icon}</span></div>`)
+                .join("")}</div>`;
+        }
+        let previousCategory = null;
+        // empty search result must render nothing, not an empty box
+        let rendered = false;
+
+        for (const setting of Object.values(settings)){
+            // an exe older than the setting would store the value and ignore it
+            if (setting.hostFeature && !voidClient.hostFeatures?.includes(setting.hostFeature)) continue;
+            if (setting.platforms && !setting.platforms.includes(voidClient.platform ?? "windows")) continue;
+            if (hiddenByPerformance(voidClient.settings.data, setting.id)) continue;
+            if (this.settingsWindow.settingSearch && !this.searchMatches(setting)) continue;
+
+            setting.html = this.generateHtml(setting);
+
+            if (previousCategory !== setting.category){
+                if (previousCategory) tempHTML += "</div>";
+
+                const legend = previousCategory === null
+                    ? `<span class="voidLegend">${REFRESH_MARK} Requires refresh ${RESTART_MARK} Requires restart</span>`
+                    : "";
+                previousCategory = setting.category;
+                tempHTML += `<div class='setHed' id="setHed_void_${setting.category}" onclick='window.windows[0].collapseFolder(this)'>
+										<span class='material-icons plusOrMinus'>keyboard_arrow_down</span> ${setting.category}${legend}</div>
+										<div class='setBodH' id="setBod_void_${setting.category}">`;
+            }
+
+            rendered = true;
+            tempHTML += `<div class='settName'>
+								${setting.name.replaceAll("{{version}}", voidClient.version ?? "")}
+								${setting.needsRestart ? RESTART_MARK : ""}
+								${setting.needsRefresh ? REFRESH_MARK : ""}
+								${setting.html}
+								${setting.description ? `<div class="voidDesc">${setting.description.replaceAll("<", "&lt;")}</div>` : ""}</div>`;
+        }
+
+        // closes category body and voidSettings box only, rest is krunker's (see init)
+        if (rendered) return `${tempHTML}</div></div>`;
+        return "";
+    }
+}
+
+export default new SettingsManager();

@@ -1,0 +1,61 @@
+<style>
+#rcBanner {
+	box-sizing: border-box;
+	display: flex;
+	gap: 1em;
+	align-items: center;
+	width: max-content;
+	max-width: min(900px, 92vw);
+	pointer-events: auto;
+	padding: 0.7em 1em 0.7em 1.2em;
+	background: #0d1530;
+	color: #ddd;
+	border: 1px solid #5aa9ff;
+	border-radius: 10px;
+	box-shadow: 0 6px 30px #000a;
+	font-family: "GameFont", sans-serif;
+	font-size: 14px;
+	line-height: 1.45;
+}
+
+#rcTitle {
+	color: #5aa9ff;
+	font-weight: bold;
+}
+
+#rcText {
+	flex: 1;
+}
+
+#rcActions {
+	display: flex;
+	flex-shrink: 0;
+	gap: 0.5em;
+}
+
+.rcButton {
+	padding: 0.45em 0.9em;
+	border-radius: 7px;
+	background: #22305f;
+	color: #fff;
+	cursor: pointer;
+	user-select: none;
+	white-space: nowrap;
+}
+
+.rcButton:hover {
+	background: #22305f;
+}
+
+.rcButton.rcMain {
+	background: #2c5fc4;
+}
+
+.rcButton.rcMain:hover {
+	background: #3a74dd;
+}
+</style>
+<div id="rcBanner">
+	<div id="rcText"><span id="rcTitle"></span> <span id="rcBody"></span></div>
+	<div id="rcActions"></div>
+</div>

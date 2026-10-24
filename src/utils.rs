@@ -1,0 +1,274 @@
+#![allow(non_snake_case)]
+use crate::CONFIG;
+use std::{
+    convert, env, fs, io,
+    path::{self, *},
+};
+#[cfg(windows)]
+use windows::{
+    Win32::{
+        Foundation::{HWND, LPARAM},
+        System::Com::CoTaskMemFree,
+        UI::{
+            Shell::{FOLDERID_Downloads, KF_FLAG_DEFAULT, SHGetKnownFolderPath},
+            WindowsAndMessaging::*,
+        },
+    },
+    core::*,
+};
+
+#[cfg(windows)]
+pub fn create_utf_string(string: impl AsRef<str>) -> Vec<u16> {
+    let s = string.as_ref();
+    let mut v = Vec::with_capacity(s.len() + 1);
+    v.extend(s.encode_utf16());
+    v.push(0);
+    v
+}
+
+#[cfg(windows)]
+pub fn LOWORD(l: usize) -> usize {
+    l & 0xffff
+}
+
+#[cfg(windows)]
+pub fn HIWORD(l: usize) -> usize {
+    (l >> 16) & 0xffff
+}
+
+#[cfg(windows)]
+pub fn settings_dir() -> path::PathBuf {
+    path::PathBuf::from(env::var("USERPROFILE").unwrap()).join("Documents").join(crate::constants::CLIENT_FOLDER)
+}
+
+// $XDG_CONFIG_HOME/<CLIENT_FOLDER>, the linux counterpart of Documents\<CLIENT_FOLDER>
+#[cfg(target_os = "linux")]
+pub fn settings_dir() -> path::PathBuf {
+    env::var_os("XDG_CONFIG_HOME")
+        .filter(|dir| !dir.is_empty())
+        .map(path::PathBuf::from)
+        .unwrap_or_else(|| path::PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".config"))
+        .join(crate::constants::CLIENT_FOLDER)
+}
+
+// refuses stuff like `https://krunker.io:pw@example.com/`
+pub fn krunker_path(url: &str) -> Option<&str> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme != "https" && scheme != "http" {
+        return None;
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, after) = rest.split_at(authority_end);
+    if authority.contains('@') {
+        return None;
+    }
+    let host = authority.split(':').next().unwrap_or("");
+    if host != "krunker.io" && !host.ends_with(".krunker.io") {
+        return None;
+    }
+    let path = after.strip_prefix('/').unwrap_or("");
+    Some(path.split(['?', '#']).next().unwrap_or(""))
+}
+
+#[cfg(target_os = "linux")]
+pub fn downloads_dir() -> path::PathBuf {
+    std::process::Command::new("xdg-user-dir")
+        .arg("DOWNLOAD")
+        .output()
+        .ok()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|dir| !dir.is_empty())
+        .map(path::PathBuf::from)
+        .unwrap_or_else(|| path::PathBuf::from(env::var_os("HOME").unwrap_or_default()).join("Downloads"))
+}
+
+#[cfg(windows)]
+pub fn downloads_dir() -> path::PathBuf {
+    unsafe {
+        if let Ok(folder) = SHGetKnownFolderPath(&FOLDERID_Downloads, KF_FLAG_DEFAULT, None) {
+            let path = folder.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(folder.0 as *const _));
+            if !path.is_empty() {
+                return path::PathBuf::from(path);
+            }
+        }
+    }
+    path::PathBuf::from(env::var("USERPROFILE").unwrap_or_default()).join("Downloads")
+}
+
+pub fn download_target(suggested: &str) -> path::PathBuf {
+    let name: String = Path::new(suggested)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if c.is_control() || "<>:\"/\\|?*".contains(c) { '_' } else { c })
+        .collect();
+    let name = if name.trim().is_empty() { "download".to_string() } else { name };
+
+    let dir = downloads_dir();
+    let target = dir.join(&name);
+    if !target.exists() {
+        return target;
+    }
+
+    // "settings (1).txt", like chromium
+    let stem = Path::new(&name).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let extension = Path::new(&name).extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    for index in 1..1000 {
+        let candidate = dir.join(format!("{stem} ({index}){extension}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    target
+}
+
+pub fn exe_dir() -> path::PathBuf {
+    env::current_exe().unwrap().parent().unwrap().to_path_buf()
+}
+
+// the portable zip ships this file, such a folder is not an msi install and must never run one
+#[cfg(windows)]
+pub fn is_portable() -> bool {
+    static PORTABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PORTABLE.get_or_init(|| exe_dir().join(crate::constants::PORTABLE_MARKER).exists())
+}
+
+pub fn config<T: serde::de::DeserializeOwned>(setting: &str, default: T) -> T {
+    CONFIG.lock().unwrap().get(setting).unwrap_or(default)
+}
+
+// subprocesses only: their CONFIG is a copy from process start, and a page reload keeps the renderer process
+pub fn config_on_disk<T: serde::de::DeserializeOwned>(setting: &str, default: T) -> T {
+    if let Some(value) = crate::modules::recovery::setting(setting) {
+        return serde_json::from_value(value).unwrap_or(default);
+    }
+    std::fs::read_to_string(settings_dir().join("settings.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|mut settings| serde_json::from_value(settings[setting].take()).ok())
+        .unwrap_or(default)
+}
+
+// None for the browser process
+pub fn process_type() -> Option<String> {
+    env::args().find_map(|arg| arg.strip_prefix("--type=").map(str::to_string))
+}
+
+pub fn has_arg(wanted: &str) -> bool {
+    env::args().any(|arg| arg == wanted)
+}
+
+// chromium only reads --raise-timer-frequency in chrome_main.cc, so every process does it itself
+pub fn raise_timer_frequency() {
+    // linux timers are not tick based, nothing to raise
+    #[cfg(windows)]
+    unsafe {
+        windows::Win32::Media::timeBeginPeriod(1);
+    }
+}
+
+// CefStringUserfree has no Display
+pub fn cef_to_string(value: &cef::CefStringUserfree) -> String {
+    cef::CefStringUtf16::from(value).to_string()
+}
+
+pub fn cef_str(value: Option<&cef::CefString>) -> String {
+    value.map(|v| v.to_string()).unwrap_or_default()
+}
+
+// substring match on the class name. chromium keeps spare widget windows, so the largest one wins
+#[cfg(windows)]
+pub fn find_child_window_by_class(parent: HWND, class_name: &str) -> HWND {
+    let mut data = (HWND::default(), class_name, 0i64);
+
+    extern "system" fn enum_child_proc(handle: HWND, lparam: LPARAM) -> BOOL {
+        unsafe {
+            let data = lparam.0 as *mut (HWND, &str, i64);
+            let target_class = (*data).1;
+            let mut class_name: [u16; 256] = [0; 256];
+
+            GetClassNameW(handle, &mut class_name);
+            let len = class_name.iter().position(|&c| c == 0).unwrap_or(256);
+            let class_slice = &class_name[..len];
+            let mut target_wide = [0u16; 64];
+            let mut target_len = 0;
+            for c in target_class.encode_utf16() {
+                target_wide[target_len] = c;
+                target_len += 1;
+            }
+            let target_slice = &target_wide[..target_len];
+            if class_slice.windows(target_len).any(|w| w == target_slice) {
+                let mut rect = windows::Win32::Foundation::RECT::default();
+                GetWindowRect(handle, &mut rect).ok();
+                let area = (rect.right - rect.left).max(0) as i64 * (rect.bottom - rect.top).max(0) as i64;
+                if (*data).0.0.is_null() || area > (*data).2 {
+                    (*data).0 = handle;
+                    (*data).2 = area;
+                }
+            }
+
+            BOOL(1)
+        }
+    }
+    unsafe {
+        let _ = EnumChildWindows(Some(parent), Some(enum_child_proc), LPARAM(&mut data as *mut (HWND, &str, i64) as _));
+        if data.0.0.is_null() {
+            crate::debug_print!("utils: no child window with class {class_name} under {parent:?}");
+        }
+
+        data.0
+    }
+}
+
+pub fn atomic_write(path: &impl AsRef<Path>, data: &impl convert::AsRef<[u8]>) -> io::Result<()> {
+    let path = path.as_ref();
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, data)?;
+
+    fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
+#[macro_export]
+macro_rules! debug_print {
+    ($($arg:tt)*) => {
+        if cfg!(feature = "verbose-logs") {
+            let msg = format!($($arg)*);
+            eprintln!("{msg}");
+            #[cfg(windows)]
+            {
+            let wide: Vec<u16> = msg.encode_utf16().chain(Some(0)).collect();
+            #[allow(unused_unsafe)]
+            unsafe {
+                ::windows::Win32::System::Diagnostics::Debug::OutputDebugStringW(
+                    ::windows::core::PCWSTR(wide.as_ptr()),
+                );
+            }
+            }
+        }
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::krunker_path;
+
+    #[test]
+    fn krunker_path_takes_the_host_from_the_authority() {
+        assert_eq!(krunker_path("https://krunker.io/"), Some(""));
+        assert_eq!(krunker_path("https://krunker.io/?game=FRA:4kpj2"), Some(""));
+        assert_eq!(krunker_path("https://assets.krunker.io/textures/a.png?build=x"), Some("textures/a.png"));
+        assert_eq!(krunker_path("https://krunker.io:443/css/main.css#x"), Some("css/main.css"));
+        assert_eq!(krunker_path("http://user-assets.krunker.io/m1/a.obj"), Some("m1/a.obj"));
+        // krunker.io as user name, the host is example.com
+        assert_eq!(krunker_path("https://krunker.io:pw@example.com/"), None);
+        assert_eq!(krunker_path("https://krunker.io@example.com/css/main.css"), None);
+        assert_eq!(krunker_path("https://example.com/krunker.io/css/main.css"), None);
+        assert_eq!(krunker_path("https://notkrunker.io/css/main.css"), None);
+        assert_eq!(krunker_path("https://krunker.io.example.com/"), None);
+        assert_eq!(krunker_path("file://C:/krunker.io/a.css"), None);
+        assert_eq!(krunker_path("krunker.io/a.css"), None);
+    }
+}

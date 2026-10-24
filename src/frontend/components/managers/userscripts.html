@@ -1,0 +1,132 @@
+<style>
+.scriptRow {
+	display: flex;
+	align-items: center;
+	gap: 0.8em;
+	padding: 0.65em 0.9em;
+	border-bottom: 1px solid #22305f;
+}
+
+.scriptRow:last-of-type {
+	border-bottom: 0;
+}
+
+.scriptInfo {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.scriptName {
+	overflow: hidden;
+	color: #fff;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.scriptName .version,
+.scriptName .author {
+	margin-left: 0.5em;
+	color: #888;
+	font-size: 0.9em;
+}
+
+.scriptDesc {
+	margin-top: 0.15em;
+	overflow: hidden;
+	color: #8c9bc4;
+	font-size: 0.9em;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.scriptFile {
+	color: #666;
+	font-size: 0.85em;
+}
+
+.scriptActions {
+	display: flex;
+	flex: 0 0 auto;
+	gap: 0.15em;
+}
+
+.scriptSettings {
+	padding: 0.4em 0.9em 0.8em 4.2em;
+	border-bottom: 1px solid #22305f;
+	background: #202020;
+}
+
+.settingRow {
+	display: flex;
+	align-items: center;
+	gap: 1em;
+	padding: 0.35em 0;
+}
+
+.settingLabel {
+	flex: 1 1 auto;
+}
+
+.settingLabel small {
+	display: block;
+	color: #888;
+}
+
+.settingRow input[type="number"],
+.settingRow input[type="text"],
+.settingRow select {
+	width: 180px;
+	padding: 0.3em 0.5em;
+	border: 1px solid #34437a;
+	border-radius: 5px;
+	background: #0a1128;
+	color: #fff;
+	font: inherit;
+}
+
+.settingRow input[type="range"] {
+	width: 160px;
+	accent-color: #5aa9ff;
+}
+
+.settingRow input[type="color"] {
+	width: 48px;
+	height: 26px;
+	border: 0;
+	background: none;
+}
+
+#usMaster {
+	display: flex;
+	align-items: center;
+	gap: 0.5em;
+	margin-right: 0.4em;
+	color: var(--muted);
+	font-size: 0.9em;
+	cursor: pointer;
+	user-select: none;
+}
+
+#usMaster.on {
+	color: var(--accent);
+}
+
+.managerPopup.scriptsOff .managerHint,
+.managerPopup.scriptsOff .managerBody {
+	opacity: 0.35;
+	pointer-events: none;
+}
+</style>
+<div class="managerPopup">
+	<div class="managerHeader">
+		<h2 class="managerTitle">Userscripts</h2>
+		<div id="usMaster" title="The same switch as Userscripts in the Void Client settings"><span>Userscripts off</span><div class="toggle"></div></div>
+		<div class="btn" id="usFolder"><span class="mi">folder_open</span>Open scripts folder</div>
+		<div class="managerClose" data-close>&times;</div>
+	</div>
+	<div class="managerHint" id="usHint">Scripts run inside Krunker. Only add scripts you trust, and never anything that breaks
+		<code>krunker.io/docs/terms.txt</code>. Drop <code>.js</code> files onto a group, or create one with New script.</div>
+	<div class="managerError" data-error hidden></div>
+	<div class="managerNotice" id="usRefresh" hidden><span>Some changes apply after a page refresh.</span><div class="btn small primary" id="usRefreshNow">Refresh now</div></div>
+	<div class="managerBody" id="usBody"></div>
+</div>

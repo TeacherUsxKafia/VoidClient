@@ -1,0 +1,102 @@
+use cef::*;
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+
+static NEXT_ID: AtomicI32 = AtomicI32::new(1);
+
+// returns the message id the reply carries in on_dev_tools_method_result
+fn call(browser: &Browser, method: &str, params: Option<DictionaryValue>) -> i32 {
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let Some(host) = browser.host() else { return id };
+    let mut params = params;
+    host.execute_dev_tools_method(id, Some(&CefString::from(method)), params.as_mut());
+    id
+}
+
+static LAST_THROTTLE_BITS: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
+
+pub fn set_cpu_throttling(browser: &Browser, value: f32) {
+    if LAST_THROTTLE_BITS.swap(value.to_bits(), Ordering::Relaxed) == value.to_bits() {
+        return;
+    }
+    let Some(params) = dictionary_value_create() else { return };
+    params.set_double(Some(&CefString::from("rate")), value as f64);
+    call(browser, "Emulation.setCPUThrottlingRate", Some(params));
+}
+
+pub fn clear_cache(browser: &Browser) {
+    set_cpu_throttling(browser, 1.0);
+
+    call(browser, "Network.clearBrowserCache", None);
+    if let Some(params) = dictionary_value_create() {
+        // "*" is not a wildcard, it silently clears nothing
+        params.set_string(Some(&CefString::from("origin")), Some(&CefString::from("https://krunker.io")));
+        params.set_string(Some(&CefString::from("storageTypes")), Some(&CefString::from("all")));
+        call(browser, "Storage.clearDataForOrigin", Some(params));
+    }
+    browser.reload();
+}
+
+// trusted click (pointer lock needs a user gesture), doesn't move the real cursor
+pub fn click(browser: &Browser, x: i32, y: i32) {
+    for event in ["mousePressed", "mouseReleased"] {
+        let Some(params) = dictionary_value_create() else { return };
+        params.set_string(Some(&CefString::from("type")), Some(&CefString::from(event)));
+        params.set_int(Some(&CefString::from("x")), x);
+        params.set_int(Some(&CefString::from("y")), y);
+        params.set_string(Some(&CefString::from("button")), Some(&CefString::from("left")));
+        params.set_int(Some(&CefString::from("clickCount")), 1);
+        call(browser, "Input.dispatchMouseEvent", Some(params));
+    }
+}
+
+// focuses the page's web contents, linux window.rs needs it after showing the page again
+#[cfg(target_os = "linux")]
+pub fn bring_to_front(browser: &Browser) {
+    call(browser, "Page.bringToFront", None);
+}
+
+// one step of the linux input replay. under pointer lock the page sees the position differences as movementX/Y
+#[cfg(target_os = "linux")]
+pub fn mouse_event(browser: &Browser, kind: &str, x: i32, y: i32, held: bool) {
+    let Some(params) = dictionary_value_create() else { return };
+    params.set_string(Some(&CefString::from("type")), Some(&CefString::from(kind)));
+    params.set_int(Some(&CefString::from("x")), x);
+    params.set_int(Some(&CefString::from("y")), y);
+    let pressing = kind != "mouseMoved";
+    params.set_string(
+        Some(&CefString::from("button")),
+        Some(&CefString::from(if pressing || held { "left" } else { "none" })),
+    );
+    params.set_int(Some(&CefString::from("buttons")), i32::from(held));
+    if pressing {
+        params.set_int(Some(&CefString::from("clickCount")), 1);
+    }
+    call(browser, "Input.dispatchMouseEvent", Some(params));
+}
+
+// page can't observe CDP, used to get secrets in without the bridge
+pub fn evaluate(browser: &Browser, expression: &str) {
+    let Some(params) = dictionary_value_create() else { return };
+    params.set_string(Some(&CefString::from("expression")), Some(&CefString::from(expression)));
+    call(browser, "Runtime.evaluate", Some(params));
+}
+
+pub fn enable_network(browser: &Browser) {
+    // history capture reads the game's own list and purchase bodies, all far smaller
+    let Some(params) = dictionary_value_create() else { return };
+    params.set_int(Some(&CefString::from("maxPostDataSize")), 64 * 1024);
+    call(browser, "Network.enable", Some(params));
+}
+
+pub fn get_response_body(browser: &Browser, request_id: &str) -> i32 {
+    let Some(params) = dictionary_value_create() else { return 0 };
+    params.set_string(Some(&CefString::from("requestId")), Some(&CefString::from(request_id)));
+    call(browser, "Network.getResponseBody", Some(params))
+}
+
+pub fn add_document_script(browser: &Browser, source: &str) {
+    let Some(params) = dictionary_value_create() else { return };
+    params.set_string(Some(&CefString::from("source")), Some(&CefString::from(source)));
+    params.set_bool(Some(&CefString::from("runImmediately")), 1);
+    call(browser, "Page.addScriptToEvaluateOnNewDocument", Some(params));
+}

@@ -1,0 +1,159 @@
+<style>
+#hkPanel {
+	box-sizing: border-box;
+	width: 620px;
+	max-width: 92vw;
+	max-height: 88vh;
+	overflow-y: auto;
+	scrollbar-width: thin;
+	scrollbar-color: #34437a #0d1530;
+	padding: 1.8em 2.2em 1.4em 2.2em;
+	background: #0d1530;
+	color: #fff;
+	border-radius: 4px;
+	box-shadow: 0 8px 48px #000c;
+	font-family: "GameFont", sans-serif;
+}
+
+#hkPanel h2 {
+	margin: 0 0 0.3em 0;
+	font-size: 1.6em;
+	letter-spacing: 1px;
+	color: #5aa9ff;
+	text-align: center;
+}
+
+#hkHint {
+	margin-bottom: 1em;
+	color: #8c9bc4;
+	text-align: center;
+	line-height: 1.5;
+}
+
+#hkPanel h3 {
+	margin: 1.2em 0 0.4em 0;
+	font-size: 0.85em;
+	font-weight: normal;
+	letter-spacing: 2px;
+	text-transform: uppercase;
+	color: #5aa9ff;
+}
+
+.hkRow {
+	display: flex;
+	gap: 0.8em;
+	align-items: center;
+	padding: 0.45em 0;
+	border-bottom: 1px solid #22305f;
+}
+
+.hkLabel {
+	flex: 1;
+	min-width: 0;
+}
+
+.hkNote {
+	display: block;
+	font-size: 0.8em;
+	color: #6f7ea8;
+}
+
+.hkKey {
+	min-width: 8em;
+	padding: 0.45em 0.8em;
+	border: 1px solid #3a3a3a;
+	border-radius: 8px;
+	background: #22305f;
+	text-align: center;
+	cursor: pointer;
+	user-select: none;
+}
+
+.hkKey:hover {
+	border-color: #5aa9ff;
+	color: #5aa9ff;
+}
+
+.hkKey.hkNone {
+	color: #6f7ea8;
+}
+
+.hkKey.hkWaiting {
+	border-color: #5aa9ff;
+	color: #5aa9ff;
+	animation: hkPulse 1s ease-in-out infinite;
+}
+
+@keyframes hkPulse {
+	50% {
+		background: #1f3a3c;
+	}
+}
+
+.hkClear {
+	color: #888;
+	cursor: pointer;
+	user-select: none;
+}
+
+.hkClear:hover {
+	color: #ff7a7a;
+}
+
+.hkWarn {
+	margin: 0.3em 0 0.2em 0;
+	padding: 0.4em 0.7em;
+	border-left: 3px solid #f0b040;
+	border-radius: 0 6px 6px 0;
+	background: #2a2416;
+	color: #f3d08a;
+	font-size: 0.85em;
+	line-height: 1.5;
+}
+
+#hkActions {
+	display: flex;
+	gap: 0.7em;
+	margin-top: 1.4em;
+}
+
+.hkButton {
+	flex: 1;
+	padding: 0.65em 0.5em;
+	border-radius: 8px;
+	background: #22305f;
+	text-align: center;
+	cursor: pointer;
+	user-select: none;
+}
+
+.hkButton:hover {
+	background: #22305f;
+	color: #5aa9ff;
+}
+
+#hkPanel { border-top: 4px solid #5aa9ff; background: linear-gradient(180deg, #0f1838 0%, #0a1028 100%); }
+#hkPanel h2 { color: #fff; letter-spacing: 0.16em; text-transform: uppercase; }
+.hkRow { margin: 0.4em 0; padding: 0.55em 0.9em; border: 1px solid #22305f; border-left: 4px solid #8b7bff; border-radius: 4px; background: #121c40; }
+
+/* side drawer on the left, full height */
+#hkPanel { width: min(540px, 100vw); max-width: 100vw; height: 100vh; max-height: none; border-radius: 0; border-top: 0; border-right: 4px solid #5aa9ff; }
+.hkInfo { display: flex; justify-content: space-between; align-items: center; gap: 1em; margin: 0.35em 0; padding: 0.5em 0.8em; border-left: 4px solid #4ade9b; background: #121c40; }
+.hkInfoName { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hkInfoKeys { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.3em; }
+.hkChip { padding: 0.15em 0.55em; background: #22305f; color: #fff; font-size: 0.85em; }
+.hkGuess { background: transparent; border: 1px dashed #5aa9ff; color: #9cc8ff; }
+</style>
+<div id="hkPanel">
+	<h2>Hotkeys</h2>
+	<div id="hkHint">Click a key, then press the new one. Escape cancels.<br>Ctrl, Alt and Shift combinations work too.</div>
+	<h3>Lobby and window</h3>
+	<div id="hkGroup-window"></div>
+	<h3>Keys from userscripts and features</h3>
+	<div id="hkNoteScripts">Dashed keys are a guess read from the script's code.</div>
+	<div id="hkScripts"></div>
+	<div id="hkActions">
+		<div class="hkButton" id="hkReset">Reset to defaults</div>
+		<div class="hkButton" id="hkDone">Done</div>
+	</div>
+</div>

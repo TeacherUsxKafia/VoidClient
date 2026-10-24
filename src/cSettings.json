@@ -1,0 +1,460 @@
+{
+    "hotkeys": {
+        "name": "Hotkeys",
+        "id": "hotkeys",
+        "description": "Change or clear Void Client's own keys (new lobby, matchmaker, reload, fullscreen, chat logs) and add keys for toggles",
+        "type": "none",
+        "category": "General",
+        "button": "Change",
+        "buttonAction": "{{voidClient}}.hotkeys.edit()",
+        "hostFeature": "hotkeys"
+    },
+    "startMode": {
+        "name": "Start Mode",
+        "id": "startMode",
+        "description": "How the window opens when Void Client starts",
+        "type": "select",
+        "category": "General",
+        "defaultValue": "Remember Previous",
+        "options": [
+            "Remember Previous",
+            "Borderless Fullscreen",
+            "Windowed",
+            "Maximized"
+        ]
+    },
+    "gameFpsLimit": {
+        "name": "FPS Limit",
+        "id": "gameFpsLimit",
+        "description": "Caps your FPS to save power and heat. 0 means unlimited",
+        "type": "slider",
+        "category": "General",
+        "defaultValue": 0,
+        "min": 0,
+        "max": 2000,
+        "step": 5
+    },
+    "rawInput": {
+        "name": "Raw Input",
+        "id": "rawInput",
+        "platforms": [
+            "windows"
+        ],
+        "description": "Mouse movement comes straight from the device, without Windows pointer acceleration, and all of it reaches the game, also when you click or scroll mid-flick. Krunker's own Raw Mouse Input follows this setting",
+        "type": "checkbox",
+        "category": "Game",
+        "defaultValue": true,
+        "needsRefresh": true
+    },
+    "rampBoost": {
+        "name": "Ramp Boosting",
+        "id": "rampBoost",
+        "description": "Scrolling makes you jump, for easier ramp boosts. Off in competitive. Turn it off if another tool already does this",
+        "type": "checkbox",
+        "category": "Game",
+        "defaultValue": false
+    },
+    "rankedAlert": {
+        "name": "Ranked Match Alert",
+        "id": "rankedAlert",
+        "description": "When Krunker's ranked queue finds a match while you are tabbed out, the client comes to the front. The Sound button sets the volume of the ranked queue window's match found sound",
+        "category": "Game",
+        "type": "checkbox",
+        "defaultValue": true,
+        "button": "Sound",
+        "buttonAction": "{{voidClient}}.queueSound?.showOptions()"
+    },
+    "exitButton": {
+        "name": "Exit Button",
+        "id": "exitButton",
+        "description": "Adds an Exit button to the menu",
+        "type": "checkbox",
+        "category": "Interface",
+        "defaultValue": true
+    },
+    "menuTimer": {
+        "name": "Menu Timer",
+        "id": "menuTimer",
+        "description": "Shows the match timer while you are in the menu",
+        "category": "Interface",
+        "type": "checkbox",
+        "defaultValue": true
+    },
+    "betterChat": {
+        "name": "Better Chat",
+        "id": "betterChat",
+        "description": "Team and all chat in one view. Press Tab to switch where you send",
+        "category": "Interface",
+        "type": "checkbox",
+        "defaultValue": true
+    },
+    "textSelect": {
+        "name": "Selectable Chat",
+        "id": "textSelect",
+        "description": "Lets you select and copy text from the chat. Select with the mouse, then Ctrl+C",
+        "category": "Interface",
+        "type": "checkbox",
+        "defaultValue": true
+    },
+    "chatLogs": {
+        "name": "Chat Logs",
+        "id": "chatLogs",
+        "description": "Keeps the last 2000 chat lines, also across lobbies, to search and copy. F1 opens them",
+        "category": "Interface",
+        "type": "checkbox",
+        "defaultValue": true,
+        "button": "Open",
+        "buttonAction": "{{voidClient}}.chatLogs?.open()"
+    },
+    "splashScreen": {
+        "name": "Splash Screen",
+        "id": "splashScreen",
+        "description": "Shows your splash image once, when the client opens. Click it to close it early",
+        "type": "checkbox",
+        "category": "Interface",
+        "defaultValue": true
+    },
+    "splashSeconds": {
+        "name": "Splash Time",
+        "id": "splashSeconds",
+        "description": "Seconds the splash image stays on screen",
+        "type": "slider",
+        "category": "Interface",
+        "defaultValue": 3,
+        "min": 1,
+        "max": 10,
+        "step": 0.5
+    },
+    "splashSize": {
+        "name": "Splash Size",
+        "id": "splashSize",
+        "description": "The most of the window the splash image may use, in percent. A smaller image file always shows smaller, it is never enlarged",
+        "type": "slider",
+        "category": "Interface",
+        "defaultValue": 40,
+        "min": 20,
+        "max": 100,
+        "step": 5
+    },
+    "renderStats": {
+        "name": "Present FPS Counter",
+        "id": "renderStats",
+        "description": "The game counter shows how fast your PC runs the game, this adds the frames that reach your screen",
+        "type": "checkbox",
+        "category": "Interface",
+        "defaultValue": false,
+        "needsRestart": true,
+        "requires": "hardFlip"
+    },
+    "swapper": {
+        "name": "Resource Swapper",
+        "id": "swapper",
+        "description": "Replaces game files like textures and sounds with the files in your swapper folder",
+        "type": "checkbox",
+        "category": "Customization",
+        "defaultValue": true,
+        "button": "Manage",
+        "buttonAction": "{{voidClient}}.swapperManager.open()",
+        "needsRefresh": true
+    },
+    "customCss": {
+        "name": "Custom CSS",
+        "id": "customCss",
+        "description": "Loads the built-in default.css and every .css file in your css folder (restart or refresh to apply changes)",
+        "type": "checkbox",
+        "category": "Customization",
+        "defaultValue": true,
+        "button": "Open Folder",
+        "buttonAction": "window.chrome.webview.postMessage('open, css')",
+        "needsRefresh": true
+    },
+    "userscripts": {
+        "name": "Userscripts",
+        "id": "userscripts",
+        "description": "Runs the built-in default scripts and every .js file in your userscripts folder. Crankshaft and idkr scripts work too",
+        "type": "checkbox",
+        "category": "Customization",
+        "defaultValue": true,
+        "button": "Manage",
+        "buttonAction": "{{voidClient}}.userscriptManager.open()"
+    },
+    "blocklist": {
+        "name": "URL Blocklist",
+        "id": "blocklist",
+        "description": "Blocks ads and trackers. Open the file to add your own entries",
+        "type": "checkbox",
+        "category": "Customization",
+        "defaultValue": true,
+        "button": "Open file",
+        "buttonAction": "window.chrome.webview.postMessage('open, blocklist')",
+        "needsRestart": true
+    },
+    "disableCats": {
+        "name": "Disable Cats",
+        "id": "disableCats",
+        "description": "Blocks the cat models in the maps",
+        "type": "checkbox",
+        "category": "Customization",
+        "defaultValue": true,
+        "needsRefresh": true
+    },
+    "disableVideoSkins": {
+        "name": "Disable Video Skins",
+        "id": "disableVideoSkins",
+        "description": "Video skins like Glitch are not loaded and show black instead, which can save FPS",
+        "type": "checkbox",
+        "category": "Customization",
+        "defaultValue": true,
+        "needsRefresh": true,
+        "hostFeature": "video-skins"
+    },
+    "uncapFps": {
+        "name": "Uncap FPS",
+        "id": "uncapFps",
+        "description": "Removes the FPS cap at your monitor's refresh rate",
+        "type": "checkbox",
+        "category": "Advanced",
+        "defaultValue": true,
+        "needsRestart": true
+    },
+    "audioFix": {
+        "name": "Fix Audio Stutters",
+        "id": "audioFix",
+        "description": "For sound that cuts out at high FPS. Moves sounds every 8 ms instead of every sample",
+        "type": "checkbox",
+        "category": "Advanced",
+        "defaultValue": true,
+        "needsRestart": true,
+        "hostFeature": "audio-fix"
+    },
+    "angleBackend": {
+        "name": "Graphics Backend (ANGLE)",
+        "id": "angleBackend",
+        "platforms": [
+            "windows"
+        ],
+        "description": "Leave it on Default (D3D11). OpenGL and Vulkan turn off everything the swapchain hook does",
+        "type": "select",
+        "category": "Advanced",
+        "defaultValue": "Default",
+        "needsRestart": true,
+        "options": [
+            "Default",
+            "D3D11",
+            "D3D11on12",
+            "OpenGL",
+            "Vulkan"
+        ]
+    },
+    "displayServer": {
+        "name": "Display Server",
+        "id": "displayServer",
+        "platforms": [
+            "linux"
+        ],
+        "description": "Leave it on X11, it runs much faster than Wayland for now. X11 also works inside a Wayland session",
+        "type": "select",
+        "category": "Advanced",
+        "defaultValue": "X11",
+        "needsRestart": true,
+        "options": [
+            "X11",
+            "Wayland"
+        ]
+    },
+    "colorProfile": {
+        "name": "Color Profile",
+        "id": "colorProfile",
+        "description": "Try sRGB if colors look washed out or too strong",
+        "type": "select",
+        "category": "Advanced",
+        "defaultValue": "Default",
+        "needsRestart": true,
+        "options": [
+            "Default",
+            "sRGB",
+            "Display P3 D65",
+            "Extended sRGB",
+            "scRGB linear",
+            "HDR10"
+        ]
+    },
+    "webviewPriority": {
+        "name": "Process Priority",
+        "id": "webviewPriority",
+        "description": "Higher can help a little, but may make your PC less stable",
+        "type": "select",
+        "category": "Advanced",
+        "defaultValue": "Normal",
+        "needsRestart": true,
+        "options": [
+            "High",
+            "Above Normal",
+            "Normal",
+            "Below Normal",
+            "Low",
+            "Idle"
+        ]
+    },
+    "x3dCacheCores": {
+        "name": "Keep Void Client on the 3D V-Cache cores",
+        "id": "x3dCacheCores",
+        "description": "Ryzen X3D with two core groups only: steadier frame pacing on the cores with the big cache",
+        "type": "checkbox",
+        "category": "Advanced",
+        "defaultValue": true,
+        "needsRestart": true,
+        "hostFeature": "x3d-cores"
+    },
+    "throttle": {
+        "name": "CPU Throttling",
+        "id": "throttle",
+        "description": "Slows the game down on purpose (2 = half speed). Only for an unstable game, an FPS limit is usually better",
+        "type": "slider",
+        "min": 1,
+        "max": 3,
+        "step": 0.01,
+        "category": "Advanced",
+        "defaultValue": 1
+    },
+    "inMenuThrottle": {
+        "name": "CPU Throttling in Menu",
+        "id": "inMenuThrottle",
+        "description": "Same, but only in the menu. It also slows the match that runs behind the menu",
+        "type": "slider",
+        "min": 1,
+        "max": 3,
+        "step": 0.01,
+        "category": "Advanced",
+        "defaultValue": 1
+    },
+    "clearCache": {
+        "name": "Clear Cache & Storage",
+        "id": "clearCache",
+        "description": "Deletes the cache and local storage. This also resets your game settings",
+        "type": "none",
+        "category": "Advanced",
+        "button": "Clear Now",
+        "buttonAction": "if(confirm('Are you sure you want to clear cache and local storage?')) { localStorage.clear(); sessionStorage.clear(); window.chrome.webview.postMessage('clear-cache'); }"
+    },
+    "hardFlip": {
+        "name": "DXGI Swapchain Hook",
+        "id": "hardFlip",
+        "platforms": [
+            "windows"
+        ],
+        "description": "Present FPS counter and OBS capture. Laptops with two graphics chips may run better without it",
+        "type": "checkbox",
+        "category": "Engine",
+        "defaultValue": true,
+        "needsRestart": true
+    },
+    "laptopPowerBoost": {
+        "name": "Laptop Power Boost",
+        "id": "laptopPowerBoost",
+        "description": "Plugged in laptops only: switches the power mode to performance while Void Client runs and puts yours back after",
+        "type": "checkbox",
+        "category": "Engine",
+        "defaultValue": true,
+        "hostFeature": "hybrid-gpu"
+    },
+    "primeOffload": {
+        "name": "NVIDIA PRIME Offload",
+        "id": "primeOffload",
+        "platforms": [
+            "linux"
+        ],
+        "description": "Hybrid laptops with the NVIDIA driver: the game renders on the NVIDIA chip instead of the built in one",
+        "type": "checkbox",
+        "category": "Engine",
+        "defaultValue": true,
+        "needsRestart": true,
+        "hostFeature": "prime-offload"
+    },
+    "patchInputPriority": {
+        "name": "Input at Normal Priority",
+        "id": "patchInputPriority",
+        "description": "Chromium patch: mouse input no longer starves the game's server messages. Off brings back the aim freeze",
+        "type": "checkbox",
+        "category": "Engine",
+        "defaultValue": true,
+        "needsRestart": true,
+        "hostFeature": "cef-patches"
+    },
+    "patchFramePacing": {
+        "name": "Frame Pacing",
+        "id": "patchFramePacing",
+        "description": "Chromium patch: the game runs one frame ahead of the screen instead of flooding it. Off brings back the GPU stutter",
+        "type": "checkbox",
+        "category": "Engine",
+        "defaultValue": true,
+        "needsRestart": true,
+        "hostFeature": "cef-patches"
+    },
+    "patchFrameLimiter": {
+        "name": "Chromium FPS Limiter",
+        "id": "patchFrameLimiter",
+        "description": "Chromium patch: holds the FPS limit inside Chromium with the CPU idle, with or without the hook. Off uses the hook's limiter, or a busy wait without the hook",
+        "type": "checkbox",
+        "category": "Engine",
+        "defaultValue": true,
+        "needsRestart": true,
+        "hostFeature": "cef-patches"
+    },
+    "patchRawInputMovement": {
+        "name": "Raw Input Keeps Movement",
+        "id": "patchRawInputMovement",
+        "platforms": [
+            "windows"
+        ],
+        "description": "Chromium patch: no mouse movement is lost on a click. Off drops a few counts at every shot",
+        "type": "checkbox",
+        "category": "Engine",
+        "defaultValue": true,
+        "needsRestart": true,
+        "hostFeature": "cef-patches"
+    },
+    "patchAudioParamCoalesce": {
+        "name": "Coalesce Audio Automation",
+        "id": "patchAudioParamCoalesce",
+        "description": "Chromium patch: the game's per frame sound updates no longer pile up. Off makes FPS drop over a long match",
+        "type": "checkbox",
+        "category": "Engine",
+        "defaultValue": true,
+        "needsRestart": true,
+        "hostFeature": "cef-patches"
+    },
+    "patchCanvasBufferCache": {
+        "name": "WebGL Buffer Cache",
+        "id": "patchCanvasBufferCache",
+        "description": "Chromium patch: keeps three spare frame buffers instead of one. Off makes some starts land in a slow mode",
+        "type": "checkbox",
+        "category": "Engine",
+        "defaultValue": true,
+        "needsRestart": true,
+        "hostFeature": "cef-patches"
+    },
+    "patchHighQoS": {
+        "name": "Game Process at High QoS",
+        "id": "patchHighQoS",
+        "platforms": [
+            "windows"
+        ],
+        "description": "Chromium patch: Windows may not throttle the game's process to save power. Off leaves that to Windows",
+        "type": "checkbox",
+        "category": "Engine",
+        "defaultValue": true,
+        "needsRestart": true,
+        "hostFeature": "cef-patches"
+    },
+    "diagnosticsReport": {
+        "name": "Diagnostics Report",
+        "id": "diagnosticsReport",
+        "description": "Puts what helps fix a problem into one file you can send. You see all of it first, nothing is uploaded",
+        "type": "none",
+        "category": "Other",
+        "button": "Create",
+        "buttonAction": "{{voidClient}}.diagnostics.open()",
+        "hostFeature": "diagnostics"
+    }
+}

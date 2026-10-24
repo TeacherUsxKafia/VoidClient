@@ -1,0 +1,191 @@
+use std::{
+    collections::HashSet,
+    fs,
+    io::Write,
+    sync::{
+        LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
+use crate::{constants, utils};
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct UserBlocklist {
+    blocked: HashSet<String>,
+    disabled_defaults: HashSet<String>,
+}
+
+// what the player added or switched off, without the example the file starts with
+pub fn user_entries() -> Vec<String> {
+    let examples = ["*://example1.com", "*://*.example2.com/*", ""];
+    let Some(user) = fs::read_to_string(utils::settings_dir().join("user_blocklist.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<UserBlocklist>(&text).ok())
+    else {
+        return Vec::new();
+    };
+    let mut entries: Vec<String> = user
+        .blocked
+        .into_iter()
+        .chain(user.disabled_defaults.into_iter().map(|url| format!("-{url}")))
+        .filter(|entry| !examples.contains(&entry.as_str()) && entry != "-")
+        .collect();
+    entries.sort();
+    entries
+}
+
+// checked on the IO thread for every request
+pub static BLOCKLIST: LazyLock<Vec<String>> = LazyLock::new(|| if utils::config("blocklist", true) { load() } else { Vec::new() });
+
+
+// separate from the blocklist setting, turning that off must not bring the cats back
+static CATS_OFF: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(utils::config("disableCats", true)));
+
+
+pub fn set_cats_off(off: bool) {
+    CATS_OFF.store(off, Ordering::Relaxed);
+}
+
+pub fn is_blocked(url: &str) -> bool {
+    (CATS_OFF.load(Ordering::Relaxed) && constants::CAT_BLOCKLIST.iter().any(|pattern| glob_match(pattern, url)))
+        || BLOCKLIST.iter().any(|pattern| glob_match(pattern, url))
+}
+
+pub const EMPTY_MODEL: &str = include_str!("../../resources/swaps/empty_model.obj");
+
+// a cancelled model broke the game's draw path for it (the clouds logged "program not valid" every frame), serve an empty one
+pub fn wants_empty_model(url: &str) -> bool {
+    utils::krunker_path(url).is_some_and(|path| path.to_ascii_lowercase().ends_with(".obj")) && is_blocked(url)
+}
+
+
+fn url_host(url: &str) -> Option<&str> {
+    let (_, rest) = url.split_once("://")?;
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    authority.rsplit('@').next()?.split(':').next()
+}
+
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut backtrack) = (usize::MAX, 0usize);
+
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = pi;
+            backtrack = ti;
+            pi += 1;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            backtrack += 1;
+            ti = backtrack;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+pub fn load() -> Vec<String> {
+    let example_blocklist: &str = r#"
+{
+    "blocked": [
+        "*://example1.com",
+        "*://*.example2.com/*"
+    ],
+    "disabled_defaults": [
+        ""
+    ]
+}"#;
+
+    let defaults: Vec<String> = serde_json::from_str(constants::DEFAULT_BLOCKLIST).unwrap();
+    if crate::modules::recovery::overrides().no_user_blocklist {
+        return defaults;
+    }
+    let blocklist_path = utils::settings_dir().join("user_blocklist.json");
+    let mut blocklist_file = if let Ok(file) = fs::OpenOptions::new().write(true).read(true).create(true).truncate(false).open(&blocklist_path) {
+        file
+    } else {
+        eprintln!("can't open blocklist file");
+        return defaults;
+    };
+
+    if blocklist_file.metadata().unwrap().len() == 0 {
+        blocklist_file.write_all(example_blocklist.as_bytes()).ok();
+    }
+
+    let blocklist_string = if let Ok(blocklist_string) = fs::read_to_string(&blocklist_path) {
+        blocklist_string
+    } else {
+        eprintln!("can't read user blocklist file");
+        blocklist_file.set_len(0).ok();
+        blocklist_file.write_all(example_blocklist.as_bytes()).ok();
+        return defaults;
+    };
+
+    let blocklist = match serde_json::from_str::<UserBlocklist>(&blocklist_string) {
+        Ok(config) => config,
+        Err(_) => {
+            eprintln!("can't parse user blocklist file");
+            blocklist_file.set_len(0).ok();
+            blocklist_file.write_all(example_blocklist.as_bytes()).ok();
+            return defaults;
+        }
+    };
+
+    defaults
+        .into_iter()
+        .filter(|url| !blocklist.disabled_defaults.contains(url))
+        .chain(blocklist.blocked)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subdomain_wildcard_matches_real_ad_url() {
+        assert!(glob_match("*://*.doubleclick.net/*", "https://googleads.g.doubleclick.net/pagead/ads?x=1"));
+    }
+
+    #[test]
+    fn trailing_star_matches_query_string() {
+        assert!(glob_match("*://krunker.io/service-worker.js*", "https://krunker.io/service-worker.js?v=3"));
+    }
+
+    #[test]
+    fn does_not_match_unrelated_host() {
+        assert!(!glob_match("*://*.doubleclick.net/*", "https://krunker.io/js/game.js"));
+    }
+
+    #[test]
+    fn cat_patterns_match_the_models() {
+        assert!(
+            constants::CAT_BLOCKLIST
+                .iter()
+                .any(|p| glob_match(p, "https://user-assets.krunker.io/61822/model.obj?v=2"))
+        );
+        assert!(
+            !constants::CAT_BLOCKLIST
+                .iter()
+                .any(|p| glob_match(p, "https://user-assets.krunker.io/61822/texture.png"))
+        );
+    }
+
+    #[test]
+    fn defaults_never_block_the_game() {
+        let defaults: Vec<String> = serde_json::from_str(constants::DEFAULT_BLOCKLIST).unwrap();
+        for url in ["https://krunker.io/", "https://krunker.io/js/game.js", "wss://lobby-fra.krunker.io/socket"] {
+            assert!(!defaults.iter().any(|p| glob_match(p, url)), "blocked {url}");
+        }
+    }
+}

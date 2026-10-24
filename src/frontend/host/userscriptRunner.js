@@ -1,0 +1,349 @@
+/**
+ * @typedef {object} HostScript What the host hands over per script
+ * @property {string} key "file.js" or "social/file.js"
+ * @property {string} group
+ * @property {string} file
+ * @property {boolean} enabled
+ * @property {"document-start"|"document-end"} runAt
+ * @property {number} priority
+ * @property {Record<string, string>} meta
+ * @property {Record<string, any>} prefs
+ * @property {Function} [run] The compiled script, absent when it did not compile
+ * @property {string} [compileError]
+ */
+
+/**
+ * @typedef {object} ScriptSetting Crankshaft's setting shape
+ * @property {string} title
+ * @property {string} [desc]
+ * @property {string} type bool, num, sel, color, text, keybind
+ * @property {any} value
+ * @property {(value: any) => void} changed
+ * @property {Array<string|number>} [opts]
+ * @property {number} [min]
+ * @property {number} [max]
+ * @property {number} [step]
+ */
+
+/**
+ * @typedef {object} ScriptEntry The live state of one script, what the manager shows
+ * @property {string} key
+ * @property {"idle"|"waiting"|"running"|"error"|"stopped"} state
+ * @property {string} error
+ * @property {Record<string, ScriptSetting>|null} settings
+ * @property {boolean} canUnload
+ * @property {boolean} tainted Failed halfway (run or unload), only runs again after a refresh
+ * @property {boolean} outdated A newer version is on disk but this one could not be stopped, the new one runs after a refresh
+ * @property {boolean} late A document-start script loaded after the page, it may have missed what it waits for
+ * @property {Record<string, string>} meta
+ * @property {string[]} keys Keys the script code seems to react to (a guess from its text, shown in the hotkeys menu)
+ * @property {() => void} start
+ * @property {() => boolean} stop false when it could not clean up, needs a refresh then
+ * @property {(key: string, value: any) => boolean} setPref
+ */
+
+/**
+ * @typedef {object} Registry Shared with the bundle
+ * @property {ScriptEntry[]} [entries]
+ * @property {() => void} [onChange] Set by the bundle
+ */
+
+/**
+ * @param {HostScript[]} scripts
+ * @param {Registry|null} registry
+ * @return {(scripts: HostScript[], replace: boolean) => void} The host keeps it to load scripts added or changed later
+ */
+// eslint-disable-next-line no-unused-vars
+function runUserscripts(scripts, registry){
+    // krunker swaps the console methods later, keep the real ones (crankshaft's _console)
+    const nativeConsole = {
+        log: console.log.bind(console),
+        warn: console.warn.bind(console),
+        error: console.error.bind(console),
+        info: console.info.bind(console),
+        debug: console.debug.bind(console),
+    };
+
+    /**
+     * Keys a script seems to listen for, read from its own code: e.key === "x", e.code === "KeyX", e.keyCode === 71.
+     * Only a guess, a script can build its keys in ways this cannot see.
+     *
+     * @param {Function|undefined} run
+     * @return {string[]}
+     */
+    const detectKeys = (run) => {
+        if (typeof run !== "function") return [];
+        let code = "";
+        try {
+            code = Function.prototype.toString.call(run);
+        }
+        catch {
+            return [];
+        }
+        /** @param {number} number */
+        const fromKeyCode = (number) => {
+            if (number >= 65 && number <= 90) return String.fromCharCode(number);
+            if (number >= 48 && number <= 57) return String(number - 48);
+            if (number >= 112 && number <= 123) return `F${number - 111}`;
+            const named = { 8: "Backspace", 9: "Tab", 13: "Enter", 27: "Escape", 32: "Space", 37: "Left", 38: "Up", 39: "Right", 40: "Down", 46: "Delete", 192: "`" };
+            return /** @type {Record<number, string>} */ (named)[number] ?? `Key ${number}`;
+        };
+        const found = new Set();
+        for (const match of code.matchAll(/\.(?:key|code)(?:\.to(?:Lower|Upper)Case\(\))?\s*[!=]==?\s*(["'`])([^"'`\s]{1,14})\1/g)){
+            if (!match[0].includes("!")) found.add(match[2].length === 1 ? match[2].toUpperCase() : match[2].replace(/^(?:Key|Digit)(?=.$)/, ""));
+        }
+        for (const match of code.matchAll(/case\s+(["'])((?:Key[A-Z]|Digit\d|F\d{1,2}|Arrow\w+|Numpad\w+|Space|Enter|Escape|Tab|Backquote)\w*)\1/g)){
+            found.add(match[2].replace(/^(?:Key|Digit)(?=.$)/, ""));
+        }
+        for (const match of code.matchAll(/\.(?:keyCode|which)\s*===?\s*(\d{1,3})/g)) found.add(fromKeyCode(Number(match[1])));
+        return [...found].slice(0, 12);
+    };
+
+    /** @type {Map<string, HTMLStyleElement>} */
+    const insertedCss = new Map();
+
+    /**
+     * Crankshaft's _css.
+     *
+     * @param {string} css
+     * @param {string} identifier
+     * @param {boolean|"toggle"} [value]
+     */
+    const toggleCss = (css, identifier, value = "toggle") => {
+        const existing = insertedCss.get(identifier);
+        const on = value === "toggle" ? !existing : value;
+        if (on && !existing){
+            const style = document.createElement("style");
+            style.dataset.voidUserscript = identifier;
+            style.textContent = css;
+            (document.head ?? document.documentElement).append(style);
+            insertedCss.set(identifier, style);
+        }
+        else if (!on && existing){
+            existing.remove();
+            insertedCss.delete(identifier);
+        }
+    };
+
+    const notify = () => {
+        try {
+            registry?.onChange?.();
+        }
+        catch {
+            // the manager's problem, not the script's
+        }
+    };
+
+    /**
+     * idkr settings -> Crankshaft's shape, so the manager only knows one.
+     *
+     * @param {Record<string, any>} idkrSettings
+     * @return {Record<string, ScriptSetting>}
+     */
+    const fromIdkr = (idkrSettings) => {
+        /** @type {Record<string, ScriptSetting>} */
+        const settings = {};
+        const types = /** @type {Record<string, string>} */ ({ checkbox: "bool", slider: "num", select: "sel", text: "text", color: "color" });
+        for (const [key, setting] of Object.entries(idkrSettings ?? {})){
+            if (!setting || !types[setting.type]) continue;
+            settings[key] = {
+                title: String(setting.name ?? key),
+                desc: setting.info,
+                type: types[setting.type],
+                value: setting.val,
+                opts: setting.options ? Object.keys(setting.options) : undefined,
+                min: setting.min,
+                max: setting.max,
+                step: setting.step,
+                changed(/** @type {any} */ value){
+                    setting.val = value;
+                    setting.set?.(value, false);
+                },
+            };
+        }
+        return settings;
+    };
+
+    /**
+     * @param {any} value
+     * @return {value is Record<string, ScriptSetting>}
+     */
+    const isSettings = (value) => Boolean(value) && typeof value === "object" && Object.keys(value).length > 0;
+
+    /**
+     * @param {HostScript} script
+     * @return {ScriptEntry}
+     */
+    const createEntry = (script) => {
+        /** @type {Function|null} */
+        let unload = null;
+        /** @type {(() => void)|null} pending DOMContentLoaded start, undone by stop */
+        let pendingStart = null;
+
+        /** @type {ScriptEntry} */
+        const entry = {
+            key: script.key,
+            state: "idle",
+            error: script.compileError ?? "",
+            settings: null,
+            canUnload: false,
+            tainted: false,
+            outdated: false,
+            late: script.runAt === "document-start" && document.readyState !== "loading",
+            meta: script.meta,
+            keys: detectKeys(script.run),
+            start: () => undefined,
+            stop: () => false,
+            setPref(key, value){
+                const setting = entry.settings?.[key];
+                if (!setting || typeof setting.changed !== "function") return false;
+                try {
+                    setting.value = value;
+                    setting.changed(value);
+                    // so a restart in this page gets the latest value
+                    script.prefs = { ...script.prefs, [key]: value };
+                    return true;
+                }
+                catch (error){
+                    nativeConsole.error(`[voidClient] userscript ${script.file}, setting ${key}:`, error);
+                    return false;
+                }
+            },
+        };
+
+        /**
+         * @param {unknown} error
+         */
+        const fail = (error) => {
+            entry.state = "error";
+            entry.error = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+            nativeConsole.error(`[voidClient] userscript ${script.file} failed:`, error);
+        };
+
+        const execute = () => {
+            if (!script.run) return;
+            const context = { _console: nativeConsole, _css: toggleCss, settings: {}, unload: /** @type {any} */ (false) };
+            const module = { exports: /** @type {any} */ ({}) };
+            try {
+                const returned = script.run.call(context, module, module.exports);
+                const exported = returned && typeof returned === "object" ? returned : context;
+                const idkrOld = typeof module.exports?.run === "function" ? module.exports : null;
+
+                if (exported.config?.apiversion === "1.0" && typeof exported.load === "function"){
+                    entry.settings = fromIdkr(exported.config.settings);
+                    if (exported.meta && !script.meta.name) entry.meta = { ...script.meta, ...exported.meta };
+                    exported.load();
+                    unload = typeof exported.unload === "function" ? exported.unload.bind(exported) : null;
+                }
+                else if (idkrOld){
+                    entry.settings = fromIdkr(idkrOld.settings);
+                    idkrOld.run.call(context);
+                }
+                else {
+                    entry.settings = isSettings(exported.settings) ? exported.settings : null;
+                    // bound, a method-style unload needs its this
+                    unload = typeof exported.unload === "function" ? exported.unload.bind(exported) : null;
+                }
+                entry.canUnload = Boolean(unload);
+                entry.state = "running";
+
+                // saved prefs like crankshaft: same type and changed only
+                for (const [key, value] of Object.entries(script.prefs ?? {})){
+                    const setting = entry.settings?.[key];
+                    if (setting && typeof setting.value === typeof value && JSON.stringify(setting.value) !== JSON.stringify(value)){
+                        entry.setPref(key, value);
+                    }
+                }
+            }
+            catch (error){
+                fail(error);
+                // rerunning would double whatever it already set up
+                entry.tainted = true;
+            }
+            notify();
+        };
+
+        entry.start = () => {
+            if (entry.state === "running" || entry.state === "waiting" || entry.tainted || !script.run) return;
+            if (script.runAt === "document-end" && document.readyState === "loading"){
+                entry.state = "waiting";
+                pendingStart = () => {
+                    pendingStart = null;
+                    entry.state = "idle";
+                    entry.start();
+                };
+                document.addEventListener("DOMContentLoaded", pendingStart, { once: true });
+                return;
+            }
+            execute();
+        };
+
+        entry.stop = () => {
+            if (entry.state === "waiting" && pendingStart){
+                document.removeEventListener("DOMContentLoaded", pendingStart);
+                pendingStart = null;
+                entry.state = "stopped";
+                notify();
+                return true;
+            }
+            if (entry.state !== "running") return !entry.tainted;
+            if (!unload) return false;
+            try {
+                unload();
+                entry.state = "stopped";
+            }
+            catch (error){
+                fail(error);
+                entry.error += " (while unloading, refresh the page to clean up)";
+                entry.tainted = true;
+                notify();
+                return false;
+            }
+            notify();
+            return true;
+        };
+
+        return entry;
+    };
+
+    /** @type {{ key: string, entry: ScriptEntry }[]} */
+    const loaded = [];
+
+    /**
+     * @param {HostScript[]} incoming
+     * @param {boolean} replace true swaps in the new code, false only starts the enabled ones that are already loaded
+     */
+    const load = (incoming, replace) => {
+        const sorted = incoming
+            .map((script, index) => ({ script, index }))
+            .sort((a, b) => (b.script.priority - a.script.priority) || (a.index - b.index))
+            .map(({ script }) => script);
+        for (const script of sorted){
+            const at = loaded.findIndex((item) => item.key === script.key);
+            const old = at === -1 ? null : loaded[at].entry;
+            if (old && !replace){
+                if (script.enabled) old.start();
+                continue;
+            }
+            // two copies of a script without unload would both run
+            if (old && !old.stop()){
+                old.outdated = true;
+                continue;
+            }
+            const entry = createEntry(script);
+            if (old) loaded[at] = { key: script.key, entry };
+            else loaded.push({ key: script.key, entry });
+            if (registry) registry.entries = loaded.map((item) => item.entry);
+            if (script.compileError){
+                entry.state = "error";
+                nativeConsole.error(`[voidClient] userscript ${script.file} does not compile: ${script.compileError}`);
+            }
+            else if (script.enabled) entry.start();
+        }
+        if (registry) registry.entries = loaded.map((item) => item.entry);
+        notify();
+    };
+
+    load(scripts, true);
+    return load;
+}

@@ -1,0 +1,925 @@
+use crate::{app, bridge, debug_print, handlers, modules, modules::hotkeys::Action, utils, utils::config};
+use cef::*;
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    ffi::c_void,
+    slice,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+use windows::{
+    Win32::{
+        Foundation::*,
+        Graphics::Gdi::*,
+        System::{DataExchange::COPYDATASTRUCT, LibraryLoader::GetModuleHandleW},
+        UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+    },
+    core::*,
+};
+
+static WINDOW_COUNT: AtomicUsize = AtomicUsize::new(0);
+static BROWSER_COUNT: AtomicUsize = AtomicUsize::new(0);
+const RENDER_STATS_TIMER: usize = 1;
+// shows the window anyway if the browser never arrives
+const SHOW_TIMER: usize = 2;
+const SHOW_TIMEOUT_MS: u32 = 4000;
+
+// cef objects are UI thread only
+thread_local! {
+    static BROWSERS: RefCell<HashMap<i32, Browser>> = RefCell::new(HashMap::new());
+    // browser id -> our window, still valid after cef tore down its own windows
+    static BROWSER_WINDOWS: RefCell<HashMap<i32, HWND>> = RefCell::new(HashMap::new());
+    static MAIN_BROWSER: RefCell<Option<Browser>> = const { RefCell::new(None) };
+    // includes windows whose browser is already gone
+    static OUR_WINDOWS: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) };
+    // cef CHECKs that set_nestable_tasks_allowed never nests
+    static IN_SIZE_MOVE_LOOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[derive(Copy, Clone, serde::Serialize, serde::Deserialize, Default, Debug)]
+pub struct Position {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+impl From<RECT> for Position {
+    fn from(rect: RECT) -> Self {
+        Position {
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+        }
+    }
+}
+
+#[derive(Copy, Clone, serde::Serialize, serde::Deserialize, Default, Debug)]
+pub struct WindowState {
+    pub fullscreen: bool,
+    // position is the restore size, this maximizes on top of it
+    #[serde(default)]
+    pub maximized: bool,
+    pub position: Position,
+}
+
+pub struct Window {
+    pub hwnd: HWND,
+    pub browser: Option<Browser>,
+    pub state: WindowState,
+    pub is_subwindow: bool,
+    // cef acked the close, next WM_CLOSE destroys the window
+    pub closing: bool,
+}
+
+impl Window {
+    pub fn toggle_fullscreen(&mut self) {
+        unsafe {
+            if self.state.fullscreen {
+                SetWindowLongPtrW(self.hwnd, GWL_STYLE, (WS_VISIBLE.0 | WS_OVERLAPPEDWINDOW.0) as _);
+
+                SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOP),
+                    self.state.position.left,
+                    self.state.position.top,
+                    self.state.position.right - self.state.position.left,
+                    self.state.position.bottom - self.state.position.top,
+                    SWP_NOZORDER | SWP_FRAMECHANGED,
+                )
+                .ok();
+                if self.state.maximized {
+                    let _ = ShowWindow(self.hwnd, SW_MAXIMIZE);
+                }
+            } else {
+                let mut placement = WINDOWPLACEMENT {
+                    length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                    ..Default::default()
+                };
+                self.state.maximized = IsZoomed(self.hwnd).as_bool();
+                let mut rect = RECT::default();
+                if self.state.maximized && GetWindowPlacement(self.hwnd, &mut placement).is_ok() {
+                    rect = placement.rcNormalPosition;
+                } else {
+                    GetWindowRect(self.hwnd, &mut rect).ok();
+                }
+                self.state.position = Position::from(rect);
+                // borderless and still maximized breaks things
+                if self.state.maximized {
+                    let _ = ShowWindow(self.hwnd, SW_RESTORE);
+                }
+
+                let h_monitor = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
+
+                let mut monitor_info = MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+
+                let _ = GetMonitorInfoW(h_monitor, &mut monitor_info);
+
+                SetWindowLongPtrW(self.hwnd, GWL_STYLE, (WS_VISIBLE.0) as _);
+
+                SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOP),
+                    monitor_info.rcMonitor.left,
+                    monitor_info.rcMonitor.top,
+                    monitor_info.rcMonitor.right - monitor_info.rcMonitor.left,
+                    monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top,
+                    SWP_NOZORDER | SWP_FRAMECHANGED,
+                )
+                .ok();
+            }
+            self.state.fullscreen = !self.state.fullscreen;
+        }
+    }
+
+    fn browser_hwnd(&self) -> Option<HWND> {
+        let host = self.browser.as_ref()?.host()?;
+        let handle = host.window_handle().0;
+        if handle.is_null() { None } else { Some(HWND(handle.cast())) }
+    }
+
+    fn resize_browser(&self, width: i32, height: i32) {
+        if let Some(browser_hwnd) = self.browser_hwnd() {
+            unsafe {
+                SetWindowPos(browser_hwnd, None, 0, 0, width, height, SWP_NOZORDER | SWP_NOACTIVATE).ok();
+            }
+        }
+    }
+}
+
+pub fn window_from_hwnd(hwnd: HWND) -> Option<&'static mut Window> {
+    unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return None;
+        }
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Window;
+        if ptr.is_null() { None } else { Some(&mut *ptr) }
+    }
+}
+
+pub fn root_hwnd(browser: &Browser) -> Option<HWND> {
+    let host = browser.host()?;
+    let handle = host.window_handle().0;
+    if handle.is_null() {
+        return None;
+    }
+    let root = unsafe { GetAncestor(HWND(handle.cast()), GA_ROOT) };
+    if root.0.is_null() { None } else { Some(root) }
+}
+
+pub fn window_from_browser(browser: &Browser) -> Option<&'static mut Window> {
+    let hwnd = BROWSER_WINDOWS
+        .with_borrow(|m| m.get(&browser.identifier()).copied())
+        .or_else(|| root_hwnd(browser))?;
+    window_from_hwnd(hwnd)
+}
+
+// a hidden page stops rendering
+pub fn set_browser_visible(browser: &Browser, visible: bool) {
+    let Some(host) = browser.host() else { return };
+    let handle = host.window_handle().0;
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = ShowWindow(HWND(handle.cast()), if visible { SW_SHOW } else { SW_HIDE });
+    }
+    if visible {
+        host.set_focus(1);
+    }
+}
+
+pub fn bring_to_front(browser: &Browser) {
+    let Some(hwnd) = root_hwnd(browser) else { return };
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        // windows' foreground lock refuses a background app, the taskbar flashes until the player comes back
+        if !SetForegroundWindow(hwnd).as_bool() || GetForegroundWindow() != hwnd {
+            let _ = FlashWindowEx(&FLASHWINFO {
+                cbSize: size_of::<FLASHWINFO>() as u32,
+                hwnd,
+                dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+                ..Default::default()
+            });
+        }
+    }
+    if let Some(host) = browser.host() {
+        host.set_focus(1);
+    }
+}
+
+// client area in screen pixels, [left, top, right, bottom]
+pub fn client_rect_on_screen(browser: &Browser) -> Option<[i32; 4]> {
+    let hwnd = root_hwnd(browser)?;
+    unsafe {
+        let mut rect = RECT::default();
+        GetClientRect(hwnd, &mut rect).ok()?;
+        let mut origin = POINT::default();
+        if !ClientToScreen(hwnd, &mut origin).as_bool() {
+            return None;
+        }
+        Some([origin.x, origin.y, origin.x + rect.right, origin.y + rect.bottom])
+    }
+}
+
+pub fn browser_by_id(id: i32) -> Option<Browser> {
+    BROWSERS.with_borrow(|b| b.get(&id).cloned())
+}
+
+// krunker.io/?mod=<name>, opened by a mod's "Use" button
+pub fn is_mod_page(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://krunker.io") else { return false };
+    let Some(query) = rest.strip_prefix("/?").or_else(|| rest.strip_prefix('?')) else {
+        return false;
+    };
+    query.split('#').next().unwrap_or("").split('&').any(|pair| pair.split('=').next() == Some("mod"))
+}
+
+pub fn main_browser() -> Option<Browser> {
+    MAIN_BROWSER.with_borrow(|b| b.clone())
+}
+
+pub fn has_main_browser() -> bool {
+    MAIN_BROWSER.with_borrow(|b| b.is_some())
+}
+
+// same as F4 does it: throttle off, pointer released, window to the front
+pub fn load_in_main(url: &str) {
+    let Some(browser) = MAIN_BROWSER.with_borrow(|b| b.clone()) else { return };
+    modules::devtools::set_cpu_throttling(&browser, 1.0);
+    if let Some(frame) = browser.main_frame() {
+        frame.load_url(Some(&CefString::from(url)));
+    }
+    modules::input::set_pointer_locked(false);
+    bring_to_front(&browser);
+}
+
+// windows start hidden so there's no black rectangle while the browser comes up
+unsafe fn show_window(window: &Window) {
+    unsafe {
+        KillTimer(Some(window.hwnd), SHOW_TIMER).ok();
+        if IsWindowVisible(window.hwnd).as_bool() {
+            return;
+        }
+        let _ = ShowWindow(
+            window.hwnd,
+            if window.state.maximized && !window.state.fullscreen {
+                SW_MAXIMIZE
+            } else {
+                SW_SHOW
+            },
+        );
+    }
+}
+
+pub fn attach_browser(browser: &Browser) {
+    BROWSER_COUNT.fetch_add(1, Ordering::SeqCst);
+    BROWSERS.with_borrow_mut(|b| b.insert(browser.identifier(), browser.clone()));
+
+    // not ours, chromium acting on its own (session restore etc)
+    let Some((hwnd, window)) = root_hwnd(browser).and_then(|hwnd| window_from_hwnd(hwnd).map(|w| (hwnd, w))) else {
+        debug_print!("window: browser {} has no voidClient window, closing it", browser.identifier());
+        if let Some(host) = browser.host() {
+            host.close_browser(1);
+        }
+        return;
+    };
+    BROWSER_WINDOWS.with_borrow_mut(|m| m.insert(browser.identifier(), hwnd));
+    window.browser = Some(browser.clone());
+    unsafe {
+        let mut rect = RECT::default();
+        GetClientRect(hwnd, &mut rect).ok();
+        window.resize_browser(rect.right - rect.left, rect.bottom - rect.top);
+        show_window(window);
+    }
+
+    if browser.is_popup() == 0 {
+        MAIN_BROWSER.set(Some(browser.clone()));
+        if let Some(bench) = modules::bench::config() {
+            modules::devtools::set_cpu_throttling(browser, bench.throttle);
+            return;
+        }
+        modules::input::attach(hwnd);
+        modules::priority::set(config("webviewPriority", "Normal".to_string()));
+        if config("renderStats", false) {
+            unsafe {
+                SetTimer(Some(hwnd), RENDER_STATS_TIMER, 100, None);
+            }
+        }
+    }
+}
+
+pub fn mark_closing(browser: &Browser) {
+    debug_print!("window: browser {} closing", browser.identifier());
+    if let Some(window) = window_from_browser(browser) {
+        window.closing = true;
+    }
+}
+
+pub fn detach_browser(browser: &Browser) {
+    let id = browser.identifier();
+    debug_print!("window: browser {id} closed");
+    BROWSERS.with_borrow_mut(|b| b.remove(&id));
+    if MAIN_BROWSER.with_borrow(|b| b.as_ref().is_some_and(|m| m.identifier() == id)) {
+        MAIN_BROWSER.set(None);
+    }
+    if let Some(window) = window_from_browser(browser) {
+        window.browser = None;
+        window.closing = true;
+        unsafe {
+            PostMessageW(Some(window.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)).ok();
+        }
+    }
+    BROWSER_WINDOWS.with_borrow_mut(|m| m.remove(&id));
+    if BROWSER_COUNT.fetch_sub(1, Ordering::SeqCst) == 1 && WINDOW_COUNT.load(Ordering::SeqCst) == 0 {
+        debug_print!("window: last browser closed, quitting");
+        quit_message_loop();
+    }
+}
+
+// same path as the title bar's close button, WM_CLOSE asks cef first
+pub fn close_window(browser: &Browser) {
+    if let Some(window) = window_from_browser(browser) {
+        unsafe {
+            PostMessageW(Some(window.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)).ok();
+        }
+    }
+}
+
+pub fn close_all() {
+    let windows: Vec<HWND> = OUR_WINDOWS.with_borrow(|w| w.clone());
+    for hwnd in windows {
+        unsafe {
+            PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)).ok();
+        }
+    }
+}
+
+pub fn handle_accelerator_key(browser: &Browser, action: Action) {
+    match action {
+        // matchmaker.js handles it
+        Action::Matchmaker if utils::config("matchmaker", false) => {}
+        Action::NewLobby | Action::Matchmaker => {
+            modules::devtools::set_cpu_throttling(browser, 1.0);
+            if let Some(frame) = browser.main_frame() {
+                let current_url = utils::cef_to_string(&frame.url());
+                let target_url = current_url
+                    .split_once("game=")
+                    .map(|(_before, after)| after.trim())
+                    .filter(|id| !id.is_empty())
+                    .map(|id| format!("https://krunker.io/?exclude={}", id))
+                    .unwrap_or_else(|| "https://krunker.io/".to_string());
+                frame.load_url(Some(&CefString::from(target_url.as_str())));
+            }
+            modules::input::set_pointer_locked(false);
+        }
+        Action::Reload => {
+            modules::devtools::set_cpu_throttling(browser, 1.0);
+            browser.reload();
+            modules::input::set_pointer_locked(false);
+        }
+        Action::Fullscreen => {
+            if let Some(window) = window_from_browser(browser) {
+                window.toggle_fullscreen();
+            }
+        }
+        Action::DevTools => {
+            if let Some(host) = browser.host() {
+                host.show_dev_tools(None, None, None, None);
+            }
+        }
+    }
+}
+
+pub fn create_main_window() {
+    let start_mode = config("startMode", "Remember Previous".to_string());
+    let state = if start_mode == "Remember Previous" {
+        config("lastPosition", None::<WindowState>)
+    } else {
+        None
+    };
+
+    if let Some([left, top, right, bottom]) = modules::bench::config().and_then(|bench| bench.rect) {
+        let locked = modules::bench::config().is_some_and(|bench| bench.locked);
+        let state = WindowState {
+            fullscreen: locked,
+            maximized: false,
+            position: Position { left, top, right, bottom },
+        };
+        let hwnd = create_window("Remember Previous", false, Some(state));
+        if locked {
+            // on top without focus, no taskbar entry, no input
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE).0 as _);
+                SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    left,
+                    top,
+                    right - left,
+                    bottom - top,
+                    SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                )
+                .ok();
+                SetWindowPos(hwnd, Some(HWND_NOTOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE).ok();
+                let _ = EnableWindow(hwnd, false);
+            }
+        }
+        create_browser(hwnd, &modules::bench::url());
+        return;
+    }
+
+    let hwnd = create_window(&start_mode, false, state);
+    if modules::bench::active() {
+        create_browser(hwnd, &modules::bench::url());
+    } else {
+        create_browser(hwnd, crate::constants::KRUNKER_URL);
+    }
+}
+
+fn create_browser(hwnd: HWND, url: &str) {
+    let mut rect = RECT::default();
+    unsafe {
+        GetClientRect(hwnd, &mut rect).ok();
+    }
+    let bounds = Rect {
+        x: 0,
+        y: 0,
+        width: rect.right - rect.left,
+        height: rect.bottom - rect.top,
+    };
+    let window_info = WindowInfo::default().set_as_child(sys::HWND(hwnd.0.cast()), &bounds);
+    let mut client = handlers::VoidClient::new();
+    let url = CefString::from(url);
+    let mut request_context = app::request_context();
+    if browser_host_create_browser(
+        Some(&window_info),
+        Some(&mut client),
+        Some(&url),
+        Some(&app::browser_settings()),
+        None,
+        request_context.as_mut(),
+    ) == 0
+    {
+        eprintln!("browser_host_create_browser failed");
+    }
+}
+
+pub fn create_popup_window(
+    features: Option<&PopupFeatures>,
+    window_info: Option<&mut WindowInfo>,
+    client: Option<&mut Option<Client>>,
+    settings: Option<&mut BrowserSettings>,
+) {
+    // missing x/y/width/height fall back to default size, centered
+    let mut window_state = None;
+    if let Some(features) = features
+        && (features.x_set != 0 || features.y_set != 0 || features.width_set != 0 || features.height_set != 0)
+    {
+        let (screen_width, screen_height) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+        let width = if features.width_set != 0 {
+            features.width
+        } else {
+            (screen_width as f32 * 0.8) as i32
+        };
+        let height = if features.height_set != 0 {
+            features.height
+        } else {
+            (screen_height as f32 * 0.8) as i32
+        };
+        let left = if features.x_set != 0 { features.x } else { (screen_width - width) / 2 };
+        let top = if features.y_set != 0 { features.y } else { (screen_height - height) / 2 };
+        window_state = Some(WindowState {
+            fullscreen: false,
+            maximized: false,
+            position: Position {
+                left,
+                top,
+                right: left + width,
+                bottom: top + height,
+            },
+        });
+    }
+
+    let hwnd = create_window("Custom", true, window_state);
+    let mut rect = RECT::default();
+    unsafe {
+        GetClientRect(hwnd, &mut rect).ok();
+    }
+    let bounds = Rect {
+        x: 0,
+        y: 0,
+        width: rect.right - rect.left,
+        height: rect.bottom - rect.top,
+    };
+    if let Some(window_info) = window_info {
+        *window_info = window_info.clone().set_as_child(sys::HWND(hwnd.0.cast()), &bounds);
+    }
+    if let Some(client) = client {
+        *client = Some(handlers::VoidClient::new());
+    }
+    if let Some(settings) = settings {
+        *settings = app::browser_settings();
+    }
+}
+
+// ask for the exact sizes so windows picks the right ico entry
+unsafe fn set_window_icons(hwnd: HWND, hinstance: HINSTANCE) {
+    unsafe {
+        for (kind, width, height) in [(ICON_SMALL, SM_CXSMICON, SM_CYSMICON), (ICON_BIG, SM_CXICON, SM_CYICON)] {
+            let (width, height) = (GetSystemMetrics(width), GetSystemMetrics(height));
+            if let Ok(icon) = LoadImageW(Some(hinstance), w!("icon"), IMAGE_ICON, width, height, LR_SHARED) {
+                SendMessageW(hwnd, WM_SETICON, Some(WPARAM(kind as usize)), Some(LPARAM(icon.0 as isize)));
+            }
+        }
+    }
+}
+
+pub fn create_window(start_mode: &str, is_subwindow: bool, init_state: Option<WindowState>) -> HWND {
+    unsafe {
+        let hinstance: HINSTANCE = GetModuleHandleW(None).unwrap().into();
+        let icon = match LoadIconW(Some(hinstance), w!("icon")) {
+            Ok(icon) => icon,
+            Err(_) => LoadIconW(None, IDI_APPLICATION).unwrap(),
+        };
+        // input.rs and the single instance check look for these names, bench must not match
+        let class_name = if modules::bench::active() {
+            w!("void_bench")
+        } else if is_subwindow {
+            w!("void_webview_subwindow")
+        } else {
+            w!("void_webview")
+        };
+        // register once, every popup leaked a brush otherwise
+        thread_local! {
+            static REGISTERED_CLASSES: RefCell<Vec<PCWSTR>> = const { RefCell::new(Vec::new()) };
+        }
+        let known = REGISTERED_CLASSES.with_borrow(|classes| classes.iter().any(|known| known.0 == class_name.0));
+        if !known {
+            let wc = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(wnd_proc_setup),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: hinstance,
+                hIcon: icon,
+                hCursor: Default::default(),
+                hbrBackground: CreateSolidBrush(COLORREF(0x00000000)),
+                lpszMenuName: PCWSTR::null(),
+                lpszClassName: class_name,
+            };
+
+            RegisterClassW(&wc);
+            REGISTERED_CLASSES.with_borrow_mut(|classes| classes.push(class_name));
+        }
+
+        let screen_width = GetSystemMetrics(SM_CXSCREEN);
+        let screen_height = GetSystemMetrics(SM_CYSCREEN);
+
+        fn windowed_size(state: &mut WindowState) {
+            let screen_width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+            let screen_height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+            let window_width = (screen_width as f32 * 0.8) as i32;
+            let window_height = (screen_height as f32 * 0.8) as i32;
+            let left = (screen_width - window_width) / 2;
+            let top = (screen_height - window_height) / 2;
+            state.fullscreen = false;
+            state.position = Position {
+                left,
+                top,
+                right: left + window_width,
+                bottom: top + window_height,
+            };
+        }
+
+        let mut state: WindowState = {
+            let mut creation_state = WindowState {
+                fullscreen: true,
+                maximized: false,
+                position: Position {
+                    left: 0,
+                    top: 0,
+                    right: screen_width,
+                    bottom: screen_height,
+                },
+            };
+            match start_mode {
+                "Borderless Fullscreen" => {}
+                "Maximized" => {
+                    // real maximize, not a screen sized window
+                    creation_state.fullscreen = false;
+                    creation_state.maximized = true;
+                    windowed_size(&mut creation_state);
+                }
+                "Remember Previous" => {
+                    if let Some(init_state) = init_state {
+                        creation_state = init_state;
+                    }
+                }
+                "Custom" => {
+                    if let Some(init_state) = init_state {
+                        creation_state = init_state;
+                    } else {
+                        windowed_size(&mut creation_state);
+                    }
+                }
+                _ => {
+                    windowed_size(&mut creation_state);
+                }
+            }
+            creation_state
+        };
+
+        let rect = RECT {
+            left: state.position.left,
+            top: state.position.top,
+            right: state.position.right,
+            bottom: state.position.bottom,
+        };
+
+        // off-screen or monitor gone
+        let h_monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONULL);
+        let (x, y, width, height) = if h_monitor.is_invalid() {
+            state.fullscreen = false;
+            (CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT)
+        } else {
+            let mut monitor = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let _ = GetMonitorInfoW(h_monitor, &mut monitor);
+
+            let w = rect.right - rect.left;
+            let h = rect.bottom - rect.top;
+
+            let clamped_x = rect.left.clamp(monitor.rcWork.left, monitor.rcWork.left.max(monitor.rcWork.right - w));
+
+            let clamped_y = rect.top.clamp(monitor.rcWork.top, monitor.rcWork.top.max(monitor.rcWork.bottom - h));
+
+            (clamped_x, clamped_y, w, h)
+        };
+
+        let hwnd: HWND = CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            class_name,
+            PCWSTR(crate::utils::create_utf_string(crate::modules::recovery::window_title()).as_ptr()),
+            WS_OVERLAPPEDWINDOW,
+            x,
+            y,
+            width,
+            height,
+            None,
+            None,
+            Some(hinstance),
+            Some((is_subwindow as isize) as *mut c_void),
+        )
+        .unwrap();
+        set_window_icons(hwnd, hinstance);
+
+        if state.fullscreen {
+            // no WS_VISIBLE, show_window has to show it: a window made visible through its style gets no taskbar button
+            SetWindowLongPtrW(hwnd, GWL_STYLE, 0);
+            // frame has to be recomputed, otherwise an unpainted strip stays at the right and bottom
+            SetWindowPos(hwnd, None, x, y, width, height, SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE).ok();
+        }
+        SetTimer(Some(hwnd), SHOW_TIMER, SHOW_TIMEOUT_MS, None);
+
+        let window = Box::new(Window {
+            hwnd,
+            browser: None,
+            state,
+            is_subwindow,
+            closing: false,
+        });
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(window) as isize);
+
+        hwnd
+    }
+}
+
+unsafe extern "system" fn wnd_proc_setup(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        if msg == WM_NCCREATE {
+            let create_struct = lparam.0 as *const CREATESTRUCTW;
+            let is_subwindow = (*create_struct).lpCreateParams as isize;
+            WINDOW_COUNT.fetch_add(1, Ordering::SeqCst);
+            OUR_WINDOWS.with_borrow_mut(|windows| windows.push(hwnd));
+            let wnd_proc = if is_subwindow == 0 {
+                wnd_proc_main as *const () as isize
+            } else {
+                wnd_proc_subwindow as *const () as isize
+            };
+
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, wnd_proc);
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+}
+
+// shared by both window kinds, Some when handled
+unsafe fn wnd_proc_common(window: &mut Window, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    unsafe {
+        match msg {
+            WM_SETFOCUS => {
+                if let Some(host) = window.browser.as_ref().and_then(|b| b.host()) {
+                    // set_focus leaves win32 focus here, keys were lost until the first click in the page.
+                    // focus from our own child is input.rs parking it on escape, leave that alone
+                    let browser_hwnd = HWND(host.window_handle().0.cast());
+                    let from = HWND(wparam.0 as _);
+                    if !browser_hwnd.is_invalid() && !IsChild(hwnd, from).as_bool() {
+                        let _ = SetFocus(Some(browser_hwnd));
+                    }
+                    host.set_focus(1);
+                }
+            }
+            // the drag loop inside DefWindowProc blocked chromium's tasks, the page froze until the mouse was released
+            // (as in cefclient's root_window_win.cc)
+            WM_SYSCOMMAND if matches!(wparam.0 as u32 & 0xFFF0, SC_MOVE | SC_SIZE) && !IN_SIZE_MOVE_LOOP.get() => {
+                IN_SIZE_MOVE_LOOP.set(true);
+                set_nestable_tasks_allowed(1);
+                let result = DefWindowProcW(hwnd, msg, wparam, lparam);
+                set_nestable_tasks_allowed(0);
+                IN_SIZE_MOVE_LOOP.set(false);
+                return Some(result);
+            }
+            WM_SIZE => {
+                let (width, height) = (utils::LOWORD(lparam.0 as usize), utils::HIWORD(lparam.0 as usize));
+                if !window.is_subwindow {
+                    crate::app::set_window_size(width as u32, height as u32);
+                }
+                window.resize_browser(width as i32, height as i32);
+            }
+            WM_DPICHANGED if !window.state.fullscreen => {
+                let suggested = *(lparam.0 as *const RECT);
+                SetWindowPos(
+                    hwnd,
+                    None,
+                    suggested.left,
+                    suggested.top,
+                    suggested.right - suggested.left,
+                    suggested.bottom - suggested.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+                .ok();
+                return Some(LRESULT(0));
+            }
+            WM_TIMER if wparam.0 == SHOW_TIMER => {
+                debug_print!("window: browser did not arrive in {SHOW_TIMEOUT_MS} ms, showing the window anyway");
+                show_window(window);
+            }
+            WM_MOVE | WM_MOVING => {
+                if let Some(host) = window.browser.as_ref().and_then(|b| b.host()) {
+                    host.notify_move_or_resize_started();
+                }
+            }
+            WM_ERASEBKGND => {
+                if window.browser.is_some() {
+                    return Some(LRESULT(1));
+                }
+            }
+            WM_CLOSE => {
+                // ask cef first, it sends WM_CLOSE again from do_close
+                if !window.closing
+                    && let Some(host) = window.browser.as_ref().and_then(|b| b.host())
+                {
+                    window.closing = true;
+                    host.close_browser(0);
+                    return Some(LRESULT(0));
+                }
+            }
+            WM_DESTROY => {
+                KillTimer(Some(hwnd), SHOW_TIMER).ok();
+                OUR_WINDOWS.with_borrow_mut(|windows| windows.retain(|known| *known != hwnd));
+                if !window.is_subwindow {
+                    // GetWindowRect is wrong when maximized or minimized
+                    let mut placement = WINDOWPLACEMENT {
+                        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                        ..Default::default()
+                    };
+                    if GetWindowPlacement(hwnd, &mut placement).is_ok() {
+                        window.state.position = Position::from(placement.rcNormalPosition);
+                        window.state.maximized = placement.showCmd == SW_SHOWMAXIMIZED.0 as u32 || IsZoomed(hwnd).as_bool();
+                    } else {
+                        let mut rect = RECT::default();
+                        GetWindowRect(hwnd, &mut rect).ok();
+                        window.state.position = Position::from(rect);
+                    }
+                    let styles = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+                    window.state.fullscreen = (styles & WS_OVERLAPPEDWINDOW.0) == 0;
+                    crate::CONFIG.lock().unwrap().set("lastPosition", window.state);
+                }
+
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                drop(Box::from_raw(window as *mut Window));
+                let count = WINDOW_COUNT.fetch_sub(1, Ordering::SeqCst);
+                debug_print!("window: {hwnd:?} destroyed, {} left", count - 1);
+                if count == 1 && BROWSER_COUNT.load(Ordering::SeqCst) == 0 {
+                    debug_print!("window: last window destroyed, quitting");
+                    quit_message_loop();
+                }
+                return Some(LRESULT(0));
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+unsafe extern "system" fn wnd_proc_main(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        let window_data_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Window;
+        if window_data_ptr.is_null() {
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        let window = &mut *window_data_ptr;
+
+        match msg {
+            WM_MOUSEWHEEL => {
+                // from the input hooks while pointer locked
+                let delta = (utils::HIWORD(wparam.0) as i16) as i32;
+                let scroll_amount = delta as f32 / WHEEL_DELTA as f32;
+                if let Some(browser) = window.browser.as_ref() {
+                    bridge::post_json(browser, &format!("{{\"wheel\":{}}}", scroll_amount));
+                }
+            }
+            modules::input::WM_RAMPBOOST_WHEEL => {
+                let delta = (utils::HIWORD(wparam.0) as i16) as i32;
+                if let Some(browser) = window.browser.as_ref() {
+                    bridge::post_json(browser, &format!("{{\"rampWheel\":{}}}", delta as f32 / WHEEL_DELTA as f32));
+                }
+            }
+            // plugged in or unplugged
+            WM_POWERBROADCAST if wparam.0 == PBT_APMPOWERSTATUSCHANGE as usize => modules::power::on_power_change(),
+            WM_TIMER if wparam.0 == RENDER_STATS_TIMER => {
+                thread_local! {
+                    static LAST_RENDER_STATS: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+                }
+                if let Some(current) = app::render_stats()
+                    && current.0 > 0
+                    && LAST_RENDER_STATS.get() != Some(current)
+                {
+                    LAST_RENDER_STATS.set(Some(current));
+                    if let Some(browser) = window.browser.as_ref() {
+                        bridge::post_json(browser, &format!("{{\"fpsInfo\":{}}}", current.0));
+                    }
+                }
+            }
+            WM_COPYDATA => {
+                let cds_ptr = lparam.0 as *mut COPYDATASTRUCT;
+                let cds = &*cds_ptr;
+                let data: &[u8] = slice::from_raw_parts(cds.lpData as *const u8, cds.cbData as usize);
+                if let Ok(mut string) = String::from_utf8(data.to_vec()) {
+                    debug_print!("window: args from another instance: {string}");
+                    string = serde_json::to_string(&string).unwrap_or_else(|_| String::new());
+                    if let Some(browser) = window.browser.as_ref() {
+                        bridge::post_json(browser, &format!("{{\"args\":{}}}", string));
+                    }
+                }
+            }
+            _ => {
+                if let Some(result) = wnd_proc_common(window, hwnd, msg, wparam, lparam) {
+                    return result;
+                }
+            }
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+}
+
+unsafe extern "system" fn wnd_proc_subwindow(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        let window_data_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Window;
+        if window_data_ptr.is_null() {
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        let window = &mut *window_data_ptr;
+
+        match msg {
+            WM_COPYDATA => {
+                // only social is left, bring the game back
+                if WINDOW_COUNT.load(Ordering::SeqCst) != 1 {
+                    return DefWindowProcW(hwnd, msg, wparam, lparam);
+                }
+                let cds_ptr = lparam.0 as *mut COPYDATASTRUCT;
+                let cds = &*cds_ptr;
+                let data = slice::from_raw_parts(cds.lpData as *const u8, cds.cbData as usize);
+                if let Ok(string) = String::from_utf8(data.to_vec()) {
+                    handlers::set_pending_args(string);
+                }
+                create_main_window();
+            }
+            _ => {
+                if let Some(result) = wnd_proc_common(window, hwnd, msg, wparam, lparam) {
+                    return result;
+                }
+            }
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+}

@@ -1,0 +1,124 @@
+// Name shown in window titles and messages. `bun run rebrand` rewrites the next two lines from branding.json
+pub const CLIENT_NAME: &str = "Void Client";
+// Folder in Documents that holds settings, css, userscripts and swapper (Documents\<CLIENT_FOLDER>)
+pub const CLIENT_FOLDER: &str = "VoidClient";
+
+// Auto-update is not built into this client (no `auto-update` feature), these only exist so the code compiles.
+// They are empty on purpose, so nothing can ever download code from somebody else.
+pub const UPDATE_URL: &str = "";
+pub const RELEASE_PAGE_URL: &str = "";
+#[cfg(windows)]
+pub const INSTALLER_ASSET: &str = "client-setup-x86_64.msi";
+// sorts after INSTALLER_ASSET: exes up to 0.1.17 run assets[0] as the installer
+#[cfg(target_os = "linux")]
+pub const APPIMAGE_ASSET: &str = "client-x86_64.AppImage";
+pub const RELEASE_DOWNLOAD_PREFIX: &str = "";
+#[cfg(windows)]
+pub const PORTABLE_MARKER: &str = "portable.flag";
+// any page script can post open-url, keep this short. trailing slash so look-alike domains don't match
+pub const OPEN_URL_ALLOWED: [&str; 2] = ["https://github.com/", "https://krunker.io/"];
+pub const JS_VERSION_URL: &str = "";
+pub const JS_BUNDLE_URL: &str = "";
+#[cfg(windows)]
+// its own id, so it never clashes with another client's single-instance lock
+pub const INSTANCE_MUTEX: &str = "Global\\0a323d10-003a-4ba7-82f2-be2bdc78ab5d";
+pub const KRUNKER_URL: &str = "https://krunker.io";
+
+pub const MSG_TO_PAGE: &str = "void-message";
+pub const MSG_FROM_PAGE: &str = "void-post";
+pub const MSG_LOAD_SCRIPTS: &str = "void-load-scripts";
+
+pub const DEFAULT_BLOCKLIST: &str = r#"[
+	"*://*.pollfish.com/*",
+	"*://*.paypalobjects.com/*",
+	"*://c.amazon-adsystem.com/*",
+  "*://config.aps.amazon-adsystem.com/*",
+  "*://securepubads.g.doubleclick.net/*",
+  "*://cookiepro.com/*",
+  "*://*.cookiepro.com/*",
+  "*://cdn.ravenjs.com/*",
+  "*://*.poll.fish/*",
+  "*://*.paypal.com/*",
+  "*://*.twitter.com/*",
+  "*://*.youtube.com/*",
+  "*://*.doubleclick.net/*",
+  "*://unpkg.com/web3*",
+  "*://storage.googleapis.com/pollfish_production/*",
+  "*://*.googletagmanager.com/*",
+  "*://apis.google.com/js/platform.js",
+  "*://imasdk.googleapis.com/*",
+  "*://*.googlesyndication.com/*",
+  "*://www.google-analytics.com/*",
+  "*://krunker.io/manifest.json*",
+  "*://krunker.io/css/google-play.css*",
+  "*://krunker.io/img/btc_icn.png*",
+  "*://krunker.io/img/app_1.png*",
+  "*://krunker.io/img/app_0.png.png*",
+  "*://krunker.io/img/muzflash.png*",
+  "*://krunker.io/service-worker.js*",
+  "*://krunker.io/libs/fflate*",
+  "*://krunker.io/libs/purejscarousel*",
+  "*://assets.krunker.io/sound/ambient_*",
+  "*://krunker.io/img/client.png*",
+  "*://krunker.io/libs/nipplejs.min.js*",
+  "*://user-assets.krunker.io/60585/*",
+  "*://fran-cdn.frvr.com/*",
+  "*://cdn.frvr.com/fran/*",
+  "*://coeus.frvr.com/*",
+  "*://krunker.io/libs/anzu.js*"
+]"#;
+
+// the cat models, blocked while "disableCats" is on
+pub const CAT_BLOCKLIST: &[&str] = &[
+    "*://user-assets.krunker.io/61822/model.obj*",
+    "*://user-assets.krunker.io/61818/model.obj*",
+    "*://user-assets.krunker.io/61814/model.obj*",
+    "*://user-assets.krunker.io/61824/model.obj*",
+    "*://user-assets.krunker.io/61815/model.obj*",
+    "*://user-assets.krunker.io/61820/model.obj*",
+    "*://user-assets.krunker.io/61821/model.obj*",
+    "*://user-assets.krunker.io/61806/model.obj*",
+    "*://user-assets.krunker.io/61823/model.obj*",
+];
+
+// checked against chromium 151.0.7922.174, recheck on a cef bump
+// --disable-stack-profiler: unbranded builds count as local builds, which sample stacks in the browser, gpu and some renderers
+// --disable-gpu-process-for-dx12-info-collection: else chromium starts a second gpu process 120 s in, only for its own statistics
+pub const DEFAULT_FLAGS: &str = r#"[
+  "--disable-features=NativeNotifications,MediaRouter,CalculateNativeWinOcclusion,HappinessTrackingSurveysForDesktopDemo,HardwareMediaKeyHandling",
+  "--disable-backgrounding-occluded-windows",
+  "--force-high-performance-gpu",
+  "--ui-disable-partial-swap",
+  "--disable-gpu-sandbox",
+  "--ignore-gpu-blocklist",
+  "--enable-gpu-rasterization",
+  "--enable-webgl-draft-extensions",
+  "--enable-zero-copy",
+  "--enable-unsafe-webgpu",
+  "--disable-2d-canvas-clip-aa",
+  "--disable-composited-antialiasing",
+  "--disable-software-rasterizer",
+  "--disable-mipmap-generation",
+  "--enable-native-gpu-memory-buffers",
+  "--disable-gpu-watchdog",
+  "--enable-features=SharedArrayBuffer",
+  "--disable-background-timer-throttling",
+  "--disable-renderer-backgrounding",
+  "--raise-timer-frequency",
+  "--wm-window-animations-disabled",
+  "--disable-low-end-device-mode",
+  "--enable-quic",
+  "--quic-max-packet-length=1460",
+  "--no-proxy-server",
+  "--no-pings",
+  "--disable-background-networking",
+  "--disable-domain-reliability",
+  "--disable-hang-monitor",
+  "--disable-breakpad",
+  "--disable-oopr-debug-crash-dump",
+  "--disable-in-process-stack-traces",
+  "--disable-stack-profiler",
+  "--disable-gpu-process-for-dx12-info-collection",
+  "--disable-component-update",
+  "--autoplay-policy=no-user-gesture-required"
+]"#;

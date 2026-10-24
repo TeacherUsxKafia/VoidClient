@@ -1,0 +1,461 @@
+use std::{
+    ffi::c_void,
+    mem::{self, transmute},
+    ptr,
+    sync::{
+        self, LazyLock,
+        atomic::{AtomicBool, AtomicPtr, AtomicUsize},
+        mpsc::{Sender, channel},
+    },
+    thread,
+};
+use windows::Win32::{
+    Foundation::*,
+    Graphics::Dwm::*,
+    System::{
+        LibraryLoader::GetModuleHandleW,
+        SystemServices::{MK_CONTROL, MK_LBUTTON},
+        Threading::*,
+    },
+    UI::{
+        Accessibility::*,
+        Input::{KeyboardAndMouse::*, *},
+        WindowsAndMessaging::*,
+    },
+};
+use windows::core::*;
+
+use crate::{debug_print, utils};
+
+static SPACE_DOWN: INPUT = INPUT {
+    r#type: INPUT_KEYBOARD,
+    Anonymous: INPUT_0 {
+        ki: KEYBDINPUT {
+            wVk: VK_SPACE,
+            wScan: 0,
+            dwFlags: KEYBD_EVENT_FLAGS(0),
+            time: 0,
+            dwExtraInfo: 0,
+        },
+    },
+};
+
+static SPACE_UP: INPUT = INPUT {
+    r#type: INPUT_KEYBOARD,
+    Anonymous: INPUT_0 {
+        ki: KEYBDINPUT {
+            wVk: VK_SPACE,
+            wScan: 0,
+            dwFlags: KEYEVENTF_KEYUP,
+            time: 0,
+            dwExtraInfo: 0,
+        },
+    },
+};
+
+static SCROLL_SENDER: LazyLock<Sender<()>> = LazyLock::new(|| {
+    let (tx, rx) = channel();
+    thread::spawn(move || {
+        debug_print!("input: rampboost input thread started id={}", unsafe { GetCurrentThreadId() });
+        while rx.recv().is_ok() {
+            unsafe {
+                let down = SendInput(&[SPACE_DOWN], mem::size_of::<INPUT>() as i32);
+                Sleep(5);
+                let up = SendInput(&[SPACE_UP], mem::size_of::<INPUT>() as i32);
+                if down != 1 || up != 1 {
+                    debug_print!("input: rampboost SendInput incomplete down={down} up={up}");
+                }
+            }
+        }
+    });
+    tx
+});
+
+// a wheel ramp boost turned into space, the keystrokes widget shows the wheel instead
+pub const WM_RAMPBOOST_WHEEL: u32 = WM_APP + 1;
+
+static mut PREV_WNDPROC_1: WNDPROC = None;
+static mut PREV_WNDPROC_2: WNDPROC = None;
+
+static POINTER_LOCKED: AtomicBool = AtomicBool::new(false);
+// off when the player bound shoot elsewhere (leftClick.js), the click is a mouse button then
+static LEFT_CLICK_F20: AtomicBool = AtomicBool::new(true);
+// a krunker control is bound to the wheel, ramp boost then passes the tick to the game as well
+static WHEEL_TO_PAGE: AtomicBool = AtomicBool::new(false);
+static F20_DOWN: AtomicBool = AtomicBool::new(false);
+static RAMPBOOST: AtomicBool = AtomicBool::new(false);
+static WINDOW_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static RENDER_WIDGET: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static HOOK_HANDLE: AtomicUsize = AtomicUsize::new(0);
+static STARTED: AtomicBool = AtomicBool::new(false);
+
+struct ChromeWindows {
+    chrome_window: HWND,
+    chrome_renderwidget: HWND,
+}
+
+impl ChromeWindows {
+    fn get(parent: HWND) -> Self {
+        let windows = ChromeWindows {
+            chrome_window: utils::find_child_window_by_class(parent, "Chrome_WidgetWin_"),
+            chrome_renderwidget: utils::find_child_window_by_class(parent, "Chrome_RenderWidgetHostHWND"),
+        };
+        debug_print!(
+            "input: child windows parent={:?} chrome={:?} render_widget={:?}",
+            parent,
+            windows.chrome_window,
+            windows.chrome_renderwidget,
+        );
+        windows
+    }
+
+    // chromium makes placeholder widgets first, the real one covers the parent
+    fn complete(&self, parent: HWND) -> bool {
+        if self.chrome_window.0.is_null() || self.chrome_renderwidget.0.is_null() {
+            return false;
+        }
+        unsafe {
+            let mut parent_rect = RECT::default();
+            let mut widget_rect = RECT::default();
+            GetClientRect(parent, &mut parent_rect).ok();
+            GetWindowRect(self.chrome_renderwidget, &mut widget_rect).ok();
+            let parent_area = (parent_rect.right - parent_rect.left).max(1) as i64 * (parent_rect.bottom - parent_rect.top).max(1) as i64;
+            let widget_area = (widget_rect.right - widget_rect.left).max(0) as i64 * (widget_rect.bottom - widget_rect.top).max(0) as i64;
+            widget_area * 2 >= parent_area
+        }
+    }
+
+    // check each window, every page load brings a new widget while the outer window stays
+    unsafe fn set_window_procs(&self) {
+        unsafe {
+            let original_proc_1 = GetWindowLongPtrW(self.chrome_window, GWLP_WNDPROC);
+            if original_proc_1 != wnd_proc_1 as *const () as isize {
+                debug_print!("input: original chrome wndproc={original_proc_1:#x}");
+                PREV_WNDPROC_1 = transmute::<isize, Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT>>(original_proc_1);
+                let _previous = SetWindowLongPtrW(self.chrome_window, GWLP_WNDPROC, wnd_proc_1 as *const () as isize);
+                debug_print!("input: installed chrome wndproc, previous={_previous:#x}");
+            }
+
+            let original_proc_2 = GetWindowLongPtrW(self.chrome_renderwidget, GWLP_WNDPROC);
+            if original_proc_2 == wnd_proc_widget as *const () as isize || original_proc_2 == wnd_proc_widget_rampboost as *const () as isize {
+                return;
+            }
+            debug_print!("input: original render widget wndproc={original_proc_2:#x}");
+            PREV_WNDPROC_2 = transmute::<isize, Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT>>(original_proc_2);
+            RENDER_WIDGET.store(self.chrome_renderwidget.0, sync::atomic::Ordering::Relaxed);
+            let _previous = SetWindowLongPtrW(self.chrome_renderwidget, GWLP_WNDPROC, widget_proc());
+            debug_print!("input: installed render widget wndproc, previous={_previous:#x}");
+        }
+    }
+}
+
+pub fn set_pointer_locked(locked: bool) {
+    POINTER_LOCKED.store(locked, sync::atomic::Ordering::Relaxed);
+    debug_print!("input: pointer locked={locked}");
+}
+
+pub fn pointer_locked() -> bool {
+    POINTER_LOCKED.load(sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_left_click_f20(enabled: bool) {
+    LEFT_CLICK_F20.store(enabled, sync::atomic::Ordering::Relaxed);
+    debug_print!("input: left click as f20={enabled}");
+}
+
+pub fn set_wheel_to_page(enabled: bool) {
+    WHEEL_TO_PAGE.store(enabled, sync::atomic::Ordering::Relaxed);
+    debug_print!("input: wheel to page with ramp boost={enabled}");
+}
+
+fn click_as_f20() -> bool {
+    POINTER_LOCKED.load(sync::atomic::Ordering::Relaxed) && LEFT_CLICK_F20.load(sync::atomic::Ordering::Relaxed)
+}
+
+// remembered so widgets hooked after a page load get the same one
+fn widget_proc() -> isize {
+    if RAMPBOOST.load(sync::atomic::Ordering::Relaxed) {
+        wnd_proc_widget_rampboost as *const () as isize
+    } else {
+        wnd_proc_widget as *const () as isize
+    }
+}
+
+pub fn set_rampboost(enabled: bool) {
+    RAMPBOOST.store(enabled, sync::atomic::Ordering::Relaxed);
+    let widget = HWND(RENDER_WIDGET.load(sync::atomic::Ordering::Relaxed));
+    if widget.0.is_null() {
+        return;
+    }
+    unsafe {
+        SetWindowLongPtrW(widget, GWLP_WNDPROC, widget_proc());
+    }
+    debug_print!("input: rampboost={enabled}");
+}
+
+// child windows can show up after on_after_created, keep looking
+pub fn attach(parent: HWND) {
+    WINDOW_HANDLE.store(parent.0, sync::atomic::Ordering::Relaxed);
+
+    thread::spawn(move || {
+        let parent = HWND(WINDOW_HANDLE.load(sync::atomic::Ordering::Relaxed));
+        for _ in 0..600 {
+            let chrome_windows = ChromeWindows::get(parent);
+            if chrome_windows.complete(parent) {
+                unsafe { chrome_windows.set_window_procs() };
+                break;
+            }
+            unsafe { Sleep(50) };
+        }
+    });
+
+    if STARTED.swap(true, sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+
+    // re-hook when the main window gets recreated or chromium swaps the widget (every page load)
+    thread::spawn(move || {
+        loop {
+            unsafe {
+                Sleep(1000);
+                let mut current_parent = HWND(WINDOW_HANDLE.load(sync::atomic::Ordering::Relaxed));
+                if !IsWindow(Some(current_parent)).as_bool() {
+                    let Ok(new_parent) = FindWindowW(w!("void_webview"), PCWSTR::null()) else {
+                        continue;
+                    };
+                    WINDOW_HANDLE.store(new_parent.0, sync::atomic::Ordering::Relaxed);
+                    debug_print!("input: main window recreated={new_parent:?}");
+                    current_parent = new_parent;
+                }
+                let widget = HWND(RENDER_WIDGET.load(sync::atomic::Ordering::Relaxed));
+                if IsWindow(Some(widget)).as_bool() {
+                    continue;
+                }
+                let new_chrome_windows = ChromeWindows::get(current_parent);
+                if new_chrome_windows.complete(current_parent) {
+                    new_chrome_windows.set_window_procs();
+                }
+            }
+        }
+    });
+
+    thread::spawn(move || {
+        unsafe {
+            debug_print!("input: WinEvent message thread started id={}", GetCurrentThreadId());
+            // kills the Chrome.WindowTranslucent pointer lock warning
+            let hook = SetWinEventHook(
+                EVENT_OBJECT_CREATE,
+                EVENT_OBJECT_CREATE,
+                None,
+                Some(window_event_proc),
+                GetCurrentProcessId(),
+                0,
+                WINEVENT_OUTOFCONTEXT,
+            );
+            HOOK_HANDLE.store(hook.0 as usize, sync::atomic::Ordering::Relaxed);
+            debug_print!("input: SetWinEventHook handle={:?}", hook);
+
+            let mut msg: MSG = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).into() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    });
+}
+
+unsafe extern "system" fn dummy_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+// OBS app audio capture needs a window in the process playing audio, runs in the audio utility process only
+pub fn spawn_audio_window_thread() {
+    thread::spawn(|| {
+        let hinstance = unsafe { GetModuleHandleW(None).unwrap().into() };
+
+        let class_name = w!("Audio_Target_Class");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(dummy_wnd_proc),
+            hInstance: hinstance,
+            lpszClassName: class_name,
+            ..Default::default()
+        };
+        unsafe { RegisterClassW(&wc) };
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+                class_name,
+                w!("Void Client audio window"),
+                WS_POPUP | WS_VISIBLE,
+                -32000,
+                -32000,
+                1,
+                1,
+                None,
+                None,
+                Some(hinstance),
+                None,
+            )
+            .unwrap()
+        };
+
+        unsafe {
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA);
+
+            // owner window keeps it off the taskbar
+            let desktop_hwnd = GetDesktopWindow();
+            SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, desktop_hwnd.0 as isize);
+
+            const DWMWA_CLOAK: u32 = 13;
+            let cloak_value: i32 = 1;
+            _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWINDOWATTRIBUTE(DWMWA_CLOAK.try_into().unwrap()),
+                &cloak_value as *const i32 as *const _,
+                std::mem::size_of::<i32>() as u32,
+            );
+
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, Some(hwnd), 0, 0).into() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    });
+}
+
+// a mouse lparam holds the cursor position, chromium would read its y as the scan code (1080p centre: "Enter")
+fn f20_lparam(up: bool) -> LPARAM {
+    let scan = unsafe { MapVirtualKeyW(VK_F20.0 as u32, MAPVK_VK_TO_VSC) } & 0xFF;
+    let transition = if up { (1 << 30) | (1 << 31) } else { 0 };
+    LPARAM((1 | (scan << 16) | transition) as isize)
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "system" fn wnd_proc_1(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        match message {
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+                if click_as_f20() {
+                    F20_DOWN.store(true, sync::atomic::Ordering::Relaxed);
+                    return CallWindowProcW(PREV_WNDPROC_1, window, WM_KEYDOWN, WPARAM(VK_F20.0 as usize), f20_lparam(false));
+                }
+                CallWindowProcW(PREV_WNDPROC_1, window, message, wparam, lparam)
+            }
+            WM_LBUTTONUP => {
+                if F20_DOWN.swap(false, sync::atomic::Ordering::Relaxed) {
+                    CallWindowProcW(PREV_WNDPROC_1, window, WM_KEYUP, WPARAM(VK_F20.0 as usize), f20_lparam(true));
+                }
+                CallWindowProcW(PREV_WNDPROC_1, window, message, wparam, lparam)
+            }
+            WM_RBUTTONDOWN | WM_RBUTTONDBLCLK | WM_XBUTTONDOWN | WM_NCXBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONDBLCLK => {
+                CallWindowProcW(PREV_WNDPROC_1, window, message, WPARAM(wparam.0 & !MK_LBUTTON.0 as usize), lparam)
+            }
+            WM_CHAR => LRESULT(1),
+            // chromium delays the next pointer lock for a few seconds after esc
+            WM_KEYDOWN | WM_KEYUP => {
+                if wparam.0 == VK_ESCAPE.0 as usize && POINTER_LOCKED.load(sync::atomic::Ordering::Relaxed) {
+                    let voidClient = WINDOW_HANDLE.load(sync::atomic::Ordering::Relaxed);
+                    let _result = SetFocus(Some(HWND(voidClient)));
+                    debug_print!("input: redirected Escape focus to client result={_result:?}");
+                }
+                CallWindowProcW(PREV_WNDPROC_1, window, message, wparam, lparam)
+            }
+            WM_MOUSEMOVE => {
+                if click_as_f20() {
+                    return CallWindowProcW(PREV_WNDPROC_1, window, message, WPARAM(wparam.0 & !MK_LBUTTON.0 as usize), lparam);
+                }
+                CallWindowProcW(PREV_WNDPROC_1, window, message, wparam, lparam)
+            }
+            WM_INPUT => {
+                let mut buffer = std::mem::MaybeUninit::<RAWINPUT>::uninit();
+                let mut size = std::mem::size_of::<RAWINPUT>() as u32;
+                // our libcef handles these itself (KuteRawInputMovementOnly), dropping them would lose movement
+                static CHROMIUM_FILTERS: LazyLock<bool> = LazyLock::new(|| crate::app::feature_enabled("KuteRawInputMovementOnly"));
+                if *CHROMIUM_FILTERS {
+                    return CallWindowProcW(PREV_WNDPROC_1, window, message, wparam, lparam);
+                }
+                // only drop packets with a button press, chromium does the movement
+                if GetRawInputData(
+                    HRAWINPUT(lparam.0 as _),
+                    RID_INPUT,
+                    Some(buffer.as_mut_ptr() as _),
+                    &mut size,
+                    mem::size_of::<RAWINPUTHEADER>() as u32,
+                ) != u32::MAX
+                {
+                    let raw = buffer.assume_init_ref();
+
+                    if raw.header.dwType == RIM_TYPEMOUSE.0 && raw.data.mouse.Anonymous.Anonymous.usButtonFlags != 0 {
+                        return LRESULT(1);
+                    };
+                }
+                CallWindowProcW(PREV_WNDPROC_1, window, message, wparam, lparam)
+            }
+            _ => CallWindowProcW(PREV_WNDPROC_1, window, message, wparam, lparam),
+        }
+    }
+}
+
+fn is_zoom_wheel(wparam: WPARAM) -> bool {
+    (wparam.0 & MK_CONTROL.0 as usize) != 0
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "system" fn wnd_proc_widget(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        match message {
+            WM_MOUSEWHEEL | WM_MOUSEHWHEEL | WM_POINTERWHEEL | WM_POINTERHWHEEL => {
+                if is_zoom_wheel(wparam) {
+                    return LRESULT(0);
+                }
+                if POINTER_LOCKED.load(sync::atomic::Ordering::Relaxed) {
+                    let voidClient = WINDOW_HANDLE.load(sync::atomic::Ordering::Relaxed);
+                    // goes to the page as a js event, fixes fps drops when scrolling
+                    PostMessageW(Some(HWND(voidClient)), message, wparam, lparam).ok();
+                    return LRESULT(1);
+                }
+                CallWindowProcW(PREV_WNDPROC_2, window, message, wparam, lparam)
+            }
+            _ => CallWindowProcW(PREV_WNDPROC_2, window, message, wparam, lparam),
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "system" fn wnd_proc_widget_rampboost(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        match message {
+            WM_MOUSEWHEEL | WM_MOUSEHWHEEL | WM_POINTERWHEEL | WM_POINTERHWHEEL => {
+                if is_zoom_wheel(wparam) {
+                    return LRESULT(0);
+                }
+                if POINTER_LOCKED.load(sync::atomic::Ordering::Relaxed) {
+                    let voidClient = WINDOW_HANDLE.load(sync::atomic::Ordering::Relaxed);
+                    // before the space goes out, so the page knows the space is ours
+                    PostMessageW(Some(HWND(voidClient)), WM_RAMPBOOST_WHEEL, wparam, lparam).ok();
+                    if WHEEL_TO_PAGE.load(sync::atomic::Ordering::Relaxed) {
+                        PostMessageW(Some(HWND(voidClient)), message, wparam, lparam).ok();
+                    }
+                    SCROLL_SENDER.send(()).ok();
+                    return LRESULT(1);
+                }
+                CallWindowProcW(PREV_WNDPROC_2, window, message, wparam, lparam)
+            }
+            _ => CallWindowProcW(PREV_WNDPROC_2, window, message, wparam, lparam),
+        }
+    }
+}
+
+unsafe extern "system" fn window_event_proc(_hook: HWINEVENTHOOK, _event: u32, hwnd: HWND, _id_object: i32, _id_child: i32, _thread: u32, _time: u32) {
+    unsafe {
+        let prop = GetPropW(hwnd, w!("Chrome.WindowTranslucent"));
+        // the pointer lock bubble is click-through, the color picker's eyedropper is translucent too (destroying it crashed on F11)
+        let click_through = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TRANSPARENT.0 as isize != 0;
+        if !prop.is_invalid() && click_through {
+            debug_print!("input: destroying translucent Chrome window={hwnd:?}");
+            PostMessageW(Some(hwnd), WM_DESTROY, WPARAM(0), LPARAM(0)).ok();
+        }
+    }
+}

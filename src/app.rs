@@ -1,0 +1,577 @@
+use crate::utils::config;
+use crate::{constants, handlers, modules, renderer, utils, window};
+use cef::{rc::*, *};
+use std::{
+    env, fs, io, result,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+#[cfg(windows)]
+use windows::Win32::Foundation::*;
+#[cfg(windows)]
+use windows::Win32::System::Memory::*;
+#[cfg(windows)]
+use windows::core::*;
+
+pub fn init_fs() -> result::Result<(), io::Error> {
+    let client_dir = utils::settings_dir();
+    let swap_dir = client_dir.join("swapper");
+    let scripts_dir = client_dir.join("userscripts").join("social");
+    let css_dir = client_dir.join("css");
+
+    let resources_dir = utils::exe_dir().join("resources");
+
+    fs::create_dir_all(&swap_dir)?;
+    // most common swap, players get the casing wrong otherwise
+    fs::create_dir_all(swap_dir.join("css"))?;
+    fs::create_dir_all(&scripts_dir)?;
+    fs::create_dir_all(&css_dir)?;
+    fs::create_dir_all(&resources_dir)?;
+    let name = crate::constants::CLIENT_NAME;
+    write_folder_note(
+        &css_dir,
+        &format!("Put any .css file in this folder and {name} loads it on every start.\r\nFiles load in name order (a-style.css, then b-style.css...). A later file wins when two rules clash.\r\nChanges show up after you refresh the game (F5) or restart {name}.\r\n"),
+    );
+    write_folder_note(
+        &client_dir.join("userscripts"),
+        &format!("Put any .js userscript in this folder and {name} runs it on every start.\r\nCrankshaft and idkr scripts work. Turn single scripts on or off in Settings > Manage Userscripts.\r\nChanges show up after you refresh the game (F5) or restart {name}.\r\n"),
+    );
+    Ok(())
+}
+
+// a short note next to the files so nobody has to guess what the folder is for. written once, never overwritten
+fn write_folder_note(dir: &std::path::Path, text: &str) {
+    let path = dir.join("README.txt");
+    if !path.exists() {
+        fs::write(path, text).ok();
+    }
+}
+
+// layout must match SharedState in render-dll/src/shared.rs
+#[repr(C)]
+pub(crate) struct SharedStats {
+    pub(crate) frame_ns: u64,
+    pub(crate) fps: u64,
+    pub(crate) target_fps: u64,
+    pub(crate) stats_request: u64,
+    pub(crate) stats_ack: u64,
+    pub(crate) present_p50_ns: u64,
+    pub(crate) present_p99_ns: u64,
+    pub(crate) present_max_ns: u64,
+    pub(crate) arrive_p99_ns: u64,
+    pub(crate) samples: u64,
+    pub(crate) limiter_mode: u64,
+    pub(crate) render_adapter: u64,
+    pub(crate) hook_state: u64,
+    // client area of the main window in physical px (width << 32 | height), the hook only prepares the chain of that size
+    pub(crate) window_size: u64,
+}
+const SHARED_STATS_SIZE: usize = std::mem::size_of::<SharedStats>();
+pub const LIMITER_VIZ: u64 = 1;
+pub const LIMITER_HR_TIMER: u64 = 2;
+
+pub(crate) static SHARED_STATS_PTR: AtomicU64 = AtomicU64::new(0);
+
+// one field of the shared mapping as an atomic. the gpu process writes the same memory, never touch it plainly
+// stats_request/stats_ack: request Release -> hook Acquire, payload, ack Release -> host Acquire, then read payload
+macro_rules! shared {
+    ($field:ident) => {{
+        let ptr = SHARED_STATS_PTR.load(Ordering::SeqCst);
+        (ptr != 0).then(|| unsafe { AtomicU64::from_ptr((ptr as usize + std::mem::offset_of!(SharedStats, $field)) as *mut u64) })
+    }};
+}
+
+fn initial_fps_limit() -> u64 {
+    match modules::bench::config() {
+        Some(bench) => bench.limit,
+        None => config("gameFpsLimit", 0),
+    }
+}
+
+// posix shm "/<name>", patch 09 opens it by name in the gpu process. a crash leaves the file in /dev/shm, the next start reuses it
+#[cfg(target_os = "linux")]
+pub fn create_frame_timing_mapping() {
+    let Ok(name) = std::ffi::CString::new(format!("/{}", modules::bench::timing_mapping_name())) else {
+        return;
+    };
+    unsafe {
+        let fd = libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600);
+        if fd < 0 {
+            return;
+        }
+        if libc::ftruncate(fd, SHARED_STATS_SIZE as libc::off_t) == 0 {
+            let view = libc::mmap(
+                std::ptr::null_mut(),
+                SHARED_STATS_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            );
+            if view != libc::MAP_FAILED {
+                std::ptr::write_bytes(view as *mut u8, 0, SHARED_STATS_SIZE);
+                SHARED_STATS_PTR.store(view as u64, Ordering::SeqCst);
+                set_target_fps(initial_fps_limit());
+            }
+        }
+        libc::close(fd);
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn remove_frame_timing_mapping() {
+    if let Ok(name) = std::ffi::CString::new(format!("/{}", modules::bench::timing_mapping_name())) {
+        unsafe { libc::shm_unlink(name.as_ptr()) };
+    }
+}
+
+// render.dll opens this in the gpu process, so it has to exist before initialize()
+#[cfg(windows)]
+pub fn create_frame_timing_mapping() {
+    let fps_limit = initial_fps_limit();
+    let name = HSTRING::from(modules::bench::timing_mapping_name());
+    unsafe {
+        if let Ok(mapping) = CreateFileMappingW(INVALID_HANDLE_VALUE, None, PAGE_READWRITE, 0, SHARED_STATS_SIZE as u32, &name) {
+            let view = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, SHARED_STATS_SIZE);
+            if !view.Value.is_null() {
+                std::ptr::write_bytes(view.Value as *mut u8, 0, SHARED_STATS_SIZE);
+                SHARED_STATS_PTR.store(view.Value as u64, Ordering::SeqCst);
+                set_target_fps(fps_limit);
+            }
+        }
+    }
+}
+
+pub fn set_target_fps(fps_limit: u64) {
+    if let Some(target) = shared!(target_fps) {
+        target.store(fps_limit, Ordering::Relaxed);
+    }
+}
+
+// chromium makes a swap chain per hwnd: a select popup on a scaled display is over 200 px both ways, so the hook
+// tells the game's chain by the main window's client size instead (a dropdown's chain got prepared and captured once)
+pub fn set_window_size(width: u32, height: u32) {
+    if let Some(size) = shared!(window_size) {
+        size.store(((width as u64) << 32) | height as u64, Ordering::Relaxed);
+    }
+}
+
+// after load_flags, before initialize: the gpu process reads it once it presents
+pub fn set_limiter_mode() {
+    let mut mode = 0;
+    if feature_enabled("KuteFrameLimiter") {
+        mode |= LIMITER_VIZ;
+    }
+    // KUTE_HR_TIMER=0 brings the old sleep plus spin back (bench key timer=sleep), the hook's own wait only runs without the chromium limiter
+    if env::var("KUTE_HR_TIMER").is_ok_and(|value| value == "0") {
+        // old wait wanted
+    } else {
+        mode |= LIMITER_HR_TIMER;
+    }
+    if let Some(field) = shared!(limiter_mode) {
+        field.store(mode, Ordering::Relaxed);
+    }
+}
+
+static STATS_REQUEST_LOCK: Mutex<()> = Mutex::new(());
+
+// present interval distribution since the last call. blocks up to 150 ms, never call on the UI thread
+pub fn take_present_intervals() -> Option<(u64, u64, u64, u64, u64)> {
+    let _one_at_a_time = STATS_REQUEST_LOCK.lock().unwrap();
+    let (request_field, ack) = (shared!(stats_request)?, shared!(stats_ack)?);
+    let request = request_field.load(Ordering::Relaxed).wrapping_add(1);
+    request_field.store(request, Ordering::Release);
+    let started = std::time::Instant::now();
+    while ack.load(Ordering::Acquire) != request {
+        if started.elapsed() > std::time::Duration::from_millis(150) {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    Some((
+        shared!(present_p50_ns)?.load(Ordering::Relaxed),
+        shared!(present_p99_ns)?.load(Ordering::Relaxed),
+        shared!(present_max_ns)?.load(Ordering::Relaxed),
+        shared!(arrive_p99_ns)?.load(Ordering::Relaxed),
+        shared!(samples)?.load(Ordering::Relaxed),
+    ))
+}
+
+// luid of the adapter the game's swap chain was created on, 0 without the hook or before the first chain
+#[cfg(windows)]
+pub fn render_adapter() -> u64 {
+    shared!(render_adapter).map(|field| field.load(Ordering::Relaxed)).unwrap_or(0)
+}
+
+// the Present1 hook as the gpu process reports it: "off" (not loaded), "waiting" (no chain has reached it yet),
+// "ready", "failed" (three tries at the first chain, final). mismatch: a chain with another Present1 was seen and left
+// as chromium made it. installUs: what installing took. modifiedChains / stockChains: what chromium got since attach
+pub fn hook_state() -> serde_json::Value {
+    // a bench overrides the setting through the env, like render_hook::load
+    #[cfg(windows)]
+    let loaded = modules::bench::hook_override().unwrap_or_else(|| *HOOK_AT_START.get().unwrap_or(&true));
+    // patch 10 measures in viz, always on: a clock read per frame, nothing to switch off like the hook
+    #[cfg(target_os = "linux")]
+    let loaded = true;
+    if !loaded {
+        return serde_json::json!({ "state": "off" });
+    }
+    let raw = shared!(hook_state).map(|field| field.load(Ordering::Acquire)).unwrap_or(0);
+    let state = match raw & 0xF {
+        1 => "ready",
+        2 => "failed",
+        _ => "waiting",
+    };
+    serde_json::json!({
+        "state": state,
+        "mismatch": raw & 16 != 0,
+        "installUs": (raw >> 8) & 0xFF_FFFF,
+        "modifiedChains": (raw >> 32) & 0xFFFF,
+        "stockChains": raw >> 48,
+    })
+}
+
+// (fps, frame_ns) from the present hook
+pub fn render_stats() -> Option<(u64, u64)> {
+    Some((shared!(fps)?.load(Ordering::Relaxed), shared!(frame_ns)?.load(Ordering::Relaxed)))
+}
+
+
+static FLAGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn angle_backend_switch(option: &str) -> Option<&'static str> {
+    match option {
+        "D3D11" => Some("d3d11"),
+        "D3D11on12" => Some("d3d11on12"),
+        "OpenGL" => Some("gl"),
+        "Vulkan" => Some("vulkan"),
+        _ => None,
+    }
+}
+
+fn color_profile_switch(option: &str) -> Option<&'static str> {
+    match option {
+        "sRGB" => Some("srgb"),
+        "Display P3 D65" => Some("display-p3-d65"),
+        "Extended sRGB" => Some("extended-srgb"),
+        "scRGB linear" => Some("scrgb-linear"),
+        "HDR10" => Some("hdr10"),
+        _ => None,
+    }
+}
+
+// the gpu process decides about the hook when it starts, a later change of the setting needs a restart
+pub static HOOK_AT_START: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub fn load_flags() {
+    HOOK_AT_START.get_or_init(|| config("hardFlip", true));
+    let mut flags = modules::flaglist::load();
+    if let Some(bench) = modules::bench::config() {
+        flags.extend(modules::bench::flags(bench));
+    } else if config("uncapFps", true) {
+        flags.push("--disable-frame-rate-limit".to_string());
+    }
+    if let Some(backend) = angle_backend_switch(&config("angleBackend", "Default".to_string())) {
+        flags.push(format!("--use-angle={backend}"));
+    }
+    if let Some(profile) = color_profile_switch(&config("colorProfile", "Default".to_string())) {
+        flags.push(format!("--force-color-profile={profile}"));
+    }
+    // present stats from viz (patch 10), what render.dll's hook measures on windows
+    #[cfg(target_os = "linux")]
+    flags.push("--enable-features=KutePresentStats".to_string());
+    // the esc bubble on f11 and pointer lock is an overlay that blocks direct scanout and tearing (patch 11)
+    #[cfg(target_os = "linux")]
+    flags.push("--enable-features=KuteNoExclusiveAccessBubble".to_string());
+    // a bench decides its patches itself (bench::flags), the settings decide for the client
+    if modules::bench::config().is_none() {
+        for patch in PATCHES {
+            flags.push(patch.flag(config(patch.setting, patch.default)));
+        }
+    }
+    *FLAGS.lock().unwrap() = flags;
+}
+
+// native wayland ties the pacing patch to the compositor's refresh (bench: 177 fps against 1359 on xwayland)
+#[cfg(target_os = "linux")]
+fn use_x11() -> bool {
+    config("displayServer", "X11".to_string()) == "X11" && std::env::var_os("DISPLAY").is_some_and(|display| !display.is_empty())
+}
+
+// one libcef patch with a feature switch (patches/README.md), toggled by a setting
+pub struct Patch {
+    pub setting: &'static str,
+    pub feature: &'static str,
+    // bench config key
+    pub key: &'static str,
+    pub default: bool,
+}
+
+impl Patch {
+    // explicit either way: chromium lets the disable list win, so a user_flags.json entry cannot re-enable a setting that is off
+    pub fn flag(&self, enabled: bool) -> String {
+        format!("--{}-features={}", if enabled { "enable" } else { "disable" }, self.feature)
+    }
+}
+
+pub const PATCHES: [Patch; 8] = [
+    Patch {
+        setting: "patchFrameLimiter",
+        feature: "KuteFrameLimiter",
+        key: "limiter",
+        default: true,
+    },
+    Patch {
+        setting: "patchInputPriority",
+        feature: "KuteInputNormalPriority",
+        key: "inprio",
+        default: true,
+    },
+    Patch {
+        setting: "patchFramePacing",
+        feature: "KuteFramePacing",
+        key: "pacing",
+        default: true,
+    },
+    Patch {
+        setting: "patchRawInputMovement",
+        feature: "KuteRawInputMovementOnly",
+        key: "rawinput",
+        default: true,
+    },
+    Patch {
+        setting: "audioFix",
+        feature: "KuteAudioPannerPerQuantum",
+        key: "panner",
+        default: false,
+    },
+    Patch {
+        setting: "patchAudioParamCoalesce",
+        feature: "KuteAudioParamCoalesce",
+        key: "coalesce",
+        default: true,
+    },
+    Patch {
+        setting: "patchCanvasBufferCache",
+        feature: "KuteCanvasBufferCache",
+        key: "canvas",
+        default: true,
+    },
+    Patch {
+        setting: "patchHighQoS",
+        feature: "KuteHighQoSForeground",
+        key: "qos",
+        default: true,
+    },
+];
+
+pub fn flags() -> Vec<String> {
+    FLAGS.lock().unwrap().clone()
+}
+
+pub fn has_flag(wanted: &str) -> bool {
+    FLAGS.lock().unwrap().iter().any(|flag| flag == wanted)
+}
+
+// --disable-features wins, like in chromium
+pub fn feature_enabled(name: &str) -> bool {
+    let listed = |switch: &str| {
+        FLAGS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|flag| flag.strip_prefix(switch))
+            .any(|list| list.split(',').any(|feature| feature.split(':').next() == Some(name)))
+    };
+    listed("--enable-features=") && !listed("--disable-features=")
+}
+
+pub fn prepare_profile() {
+    let profile_dir = cache_dir().join("Default");
+    if let Ok(entries) = fs::read_dir(profile_dir.join("Sessions")) {
+        for entry in entries.flatten() {
+            fs::remove_file(entry.path()).ok();
+        }
+    }
+
+    let path = profile_dir.join("Preferences");
+    let mut prefs = fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let before = prefs.to_string();
+
+    let wanted = [
+        ("profile.exit_type", serde_json::Value::String("Normal".to_string())),
+        ("credentials_enable_service", serde_json::Value::Bool(false)),
+        ("credentials_enable_autosignin", serde_json::Value::Bool(false)),
+        ("autofill.profile_enabled", serde_json::Value::Bool(false)),
+        ("autofill.credit_card_enabled", serde_json::Value::Bool(false)),
+        ("translate.enabled", serde_json::Value::Bool(false)),
+        // cef's --disable-spell-checking is read nowhere in 151, the pref is what turns it off
+        ("browser.enable_spellchecking", serde_json::Value::Bool(false)),
+    ];
+    for (key, value) in wanted {
+        let mut node = &mut prefs;
+        for part in key.split('.') {
+            if !node.is_object() {
+                *node = serde_json::json!({});
+            }
+            node = node.as_object_mut().unwrap().entry(part).or_insert(serde_json::Value::Null);
+        }
+        *node = value;
+    }
+
+    let after = prefs.to_string();
+    if after != before {
+        fs::create_dir_all(&profile_dir).ok();
+        utils::atomic_write(&path, &after).ok();
+    }
+}
+
+// one browser process per profile, so bench gets its own
+fn cache_dir() -> std::path::PathBuf {
+    if modules::bench::active() {
+        modules::bench::profile_dir()
+    } else {
+        utils::settings_dir().join("cef")
+    }
+}
+
+pub fn settings() -> Settings {
+    let cache_dir = cache_dir();
+    let log_file = utils::settings_dir().join("cef_debug.log");
+    Settings {
+        // a plain exe can't host the sandbox, needs the bootstrap.exe model
+        no_sandbox: 1,
+        // browser shaped with an Electron token
+        user_agent_product: CefString::from(format!("Chrome/{0}.0.0.0 Electron/{0}.0.0", sys::CHROME_VERSION_MAJOR).as_str()),
+        locale: CefString::from("en-US"),
+        accept_language_list: CefString::from("en-US,en"),
+        root_cache_path: CefString::from(cache_dir.to_string_lossy().as_ref()),
+        cache_path: CefString::from(cache_dir.to_string_lossy().as_ref()),
+        persist_session_cookies: 1,
+        background_color: 0xFF000000,
+        log_file: CefString::from(log_file.to_string_lossy().as_ref()),
+        log_severity: if cfg!(feature = "verbose-logs") {
+            LogSeverity::WARNING
+        } else {
+            LogSeverity::DISABLE
+        },
+        remote_debugging_port: env::var("KUTE_DEBUG_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+        ..Default::default()
+    }
+}
+
+// same storage as the global context, but with our handler (the global one can't have one)
+pub fn request_context() -> Option<RequestContext> {
+    let cache_dir = cache_dir();
+    let settings = RequestContextSettings {
+        cache_path: CefString::from(cache_dir.to_string_lossy().as_ref()),
+        persist_session_cookies: 1,
+        accept_language_list: CefString::from("en-US,en"),
+        ..Default::default()
+    };
+    let mut handler = handlers::VoidRequestContextHandler::new();
+    request_context_create_context(Some(&settings), Some(&mut handler))
+}
+
+pub fn browser_settings() -> BrowserSettings {
+    BrowserSettings {
+        background_color: 0xFF000000,
+        chrome_status_bubble: State::DISABLED,
+        chrome_zoom_bubble: State::DISABLED,
+        ..Default::default()
+    }
+}
+
+// merge with what cef already set
+fn merge_list_switch(cmd: &mut CommandLine, key: &str, value: &str) {
+    let name = CefString::from(key);
+    let existing = if cmd.has_switch(Some(&name)) != 0 {
+        utils::cef_to_string(&cmd.switch_value(Some(&name)))
+    } else {
+        String::new()
+    };
+    let mut parts: Vec<&str> = existing.split(',').filter(|s| !s.is_empty()).collect();
+    for v in value.split(',').filter(|s| !s.is_empty()) {
+        if !parts.contains(&v) {
+            parts.push(v);
+        }
+    }
+    let joined = parts.join(",");
+    cmd.append_switch_with_value(Some(&name), Some(&CefString::from(joined.as_str())));
+}
+
+wrap_browser_process_handler! {
+    struct VoidBrowserProcessHandler;
+
+    impl BrowserProcessHandler {
+        fn on_context_initialized(&self) {
+            if modules::bench::active() {
+                window::create_main_window();
+                return;
+            }
+
+
+            window::create_main_window();
+
+            #[cfg(feature = "auto-update")]
+            if config("checkUpdates", true) {
+                // a new bundle applies on the next navigation
+                std::thread::spawn(modules::updater::run);
+            }
+        }
+    }
+}
+
+wrap_app! {
+    pub struct VoidApp;
+
+    impl App {
+        fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
+            Some(VoidBrowserProcessHandler::new())
+        }
+
+        fn render_process_handler(&self) -> Option<RenderProcessHandler> {
+            Some(renderer::VoidRenderProcessHandler::new())
+        }
+
+        fn on_before_command_line_processing(&self, process_type: Option<&CefString>, command_line: Option<&mut CommandLine>) {
+            // subprocesses inherit the switches
+            if !process_type.map(|t| t.to_string().is_empty()).unwrap_or(true) {
+                return;
+            }
+            let Some(cmd) = command_line else { return };
+
+            for flag in FLAGS.lock().unwrap().iter() {
+                let flag = flag.trim_start_matches("--");
+                match flag.split_once('=') {
+                    Some((k, v)) if k == "disable-features" || k == "enable-features" => merge_list_switch(cmd, k, v),
+                    Some((k, v)) => cmd.append_switch_with_value(Some(&CefString::from(k)), Some(&CefString::from(v))),
+                    None => cmd.append_switch(Some(&CefString::from(flag))),
+                }
+            }
+            cmd.append_switch(Some(&CefString::from("disable-pinch")));
+            // otherwise chromium restores the last session in its own window
+            cmd.append_switch(Some(&CefString::from("no-startup-window")));
+            cmd.append_switch(Some(&CefString::from("hide-crash-restore-bubble")));
+            // chromium 151 shows a modal terms dialog on a linux first run (MasterPrefs::eula_required defaults to true)
+            #[cfg(target_os = "linux")]
+            cmd.append_switch(Some(&CefString::from("no-first-run")));
+            // after the flag loop, so an --ozone-platform from the command line or user_flags.json wins
+            #[cfg(target_os = "linux")]
+            if cmd.has_switch(Some(&CefString::from("ozone-platform"))) == 0 && use_x11() {
+                cmd.append_switch_with_value(Some(&CefString::from("ozone-platform")), Some(&CefString::from("x11")));
+            }
+            // on native wayland the pacing patch waits for the compositor's frame feedback, which holds the game at the refresh
+            // rate and keeps hyprland/kwin from tearing. the disable list wins, so this also covers a bench and user_flags.json
+            #[cfg(target_os = "linux")]
+            if utils::cef_to_string(&cmd.switch_value(Some(&CefString::from("ozone-platform")))) != "x11" {
+                merge_list_switch(cmd, "disable-features", "KuteFramePacing");
+            }
+        }
+    }
+}

@@ -1,0 +1,6 @@
+# build output (the two bundle files are kept)
+target/*
+!target/bundle.js
+!target/bundle_version
+node_modules/
+*.pdb

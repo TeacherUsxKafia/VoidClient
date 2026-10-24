@@ -1,0 +1,316 @@
+use std::{
+    ffi::c_void,
+    sync::{
+        LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
+use windows::{
+    Win32::{
+        Foundation::*,
+        Graphics::{
+            Direct3D11::*,
+            Dxgi::{Common::*, *},
+        },
+        System::{Memory::*, Threading::*},
+    },
+    core::*,
+};
+
+const MAGIC: u32 = 0x5052_4347;
+const VERSION: u32 = 1;
+#[repr(C, packed)]
+struct VoidCaptureInfo {
+    magic: u32,
+    version: u32,
+    width: u32,
+    height: u32,
+    format: u32,
+    flags: u32,
+    frame_counter: u64,
+    reserved: [u64; 2],
+}
+
+static INFO_PTR: AtomicU64 = AtomicU64::new(0);
+
+struct Capture {
+    pid: u32,
+    last_copy: Option<Instant>,
+    mapping: usize,
+    frame_event: usize,
+    // keeps the VoidCaptureTex_<pid> name alive while published
+    shared_handle: Option<usize>,
+    device: Option<ID3D11Device>,
+    context: Option<ID3D11DeviceContext>,
+    shared_tex: Option<ID3D11Texture2D>,
+    // device the shared texture lives on, a copy needs both on the same one
+    tex_device: usize,
+    cached_w: u32,
+    cached_h: u32,
+    cached_format: u32,
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        crate::debug_print!("capture: dropping state for pid {}", self.pid);
+        unsafe {
+            let mapping = HANDLE(self.mapping as *mut _);
+            if !mapping.0.is_null() {
+                let _ = CloseHandle(mapping);
+            }
+            let frame_event = HANDLE(self.frame_event as *mut _);
+            if !frame_event.0.is_null() {
+                let _ = CloseHandle(frame_event);
+            }
+            if let Some(h) = self.shared_handle {
+                let _ = CloseHandle(HANDLE(h as *mut _));
+            }
+        }
+    }
+}
+
+impl Capture {
+    fn release_shared(&mut self) {
+        if self.shared_handle.is_some() || self.shared_tex.is_some() {
+            crate::debug_print!("capture: releasing published shared texture");
+        }
+        if let Some(h) = self.shared_handle.take() {
+            unsafe {
+                let _ = CloseHandle(HANDLE(h as *mut _));
+            }
+        }
+        self.shared_tex = None;
+    }
+}
+
+static CAPTURE: LazyLock<Mutex<Option<Capture>>> = LazyLock::new(|| Mutex::new(None));
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(Some(0)).collect()
+}
+
+const READER_ACTIVE: u32 = 0x1;
+// max 240 copies/s, copying every frame of an uncapped game eats memory bandwidth for nothing
+const MIN_COPY_INTERVAL: std::time::Duration = std::time::Duration::from_micros(4_150);
+// control block mapping, the struct is 48 bytes
+const INFO_SIZE: usize = 64;
+
+pub fn capture_init() {
+    let pid = unsafe { GetCurrentProcessId() };
+    crate::debug_print!("capture: initialization started for pid {pid}");
+    unsafe {
+        let info_name = wide(&format!("VoidCaptureInfo_{pid}"));
+        let event_name = wide(&format!("VoidCaptureFrame_{pid}"));
+
+        let mapping = match CreateFileMappingW(INVALID_HANDLE_VALUE, None, PAGE_READWRITE, 0, INFO_SIZE as u32, PCWSTR(info_name.as_ptr())) {
+            Ok(m) => m,
+            Err(_e) => {
+                crate::debug_print!("capture: CreateFileMappingW failed: {_e}");
+                return;
+            }
+        };
+
+        let view = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, INFO_SIZE);
+        if view.Value.is_null() {
+            crate::debug_print!("capture: MapViewOfFile failed");
+            let _ = CloseHandle(mapping);
+            return;
+        }
+
+        std::ptr::write_bytes(view.Value as *mut u8, 0, INFO_SIZE);
+        let info = view.Value as *mut VoidCaptureInfo;
+        std::ptr::addr_of_mut!((*info).magic).write_unaligned(MAGIC);
+        std::ptr::addr_of_mut!((*info).version).write_unaligned(VERSION);
+
+        let frame_event = match CreateEventW(None, false, false, PCWSTR(event_name.as_ptr())) {
+            Ok(e) => e,
+            Err(_e) => {
+                crate::debug_print!("capture: CreateEventW failed: {_e}");
+                return;
+            }
+        };
+
+        INFO_PTR.store(view.Value as u64, Ordering::Release);
+
+        *CAPTURE.lock().unwrap() = Some(Capture {
+            pid,
+            last_copy: None,
+            mapping: mapping.0 as usize,
+            frame_event: frame_event.0 as usize,
+            shared_handle: None,
+            device: None,
+            context: None,
+            shared_tex: None,
+            tex_device: 0,
+            cached_w: 0,
+            cached_h: 0,
+            cached_format: 0,
+        });
+
+        crate::debug_print!("capture: initialized, pid {pid}");
+    }
+}
+
+pub fn capture_on_swapchain(_swapchain: *mut c_void, device: Option<ID3D11Device>) {
+    if INFO_PTR.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    if let Ok(mut guard) = CAPTURE.lock()
+        && let Some(c) = guard.as_mut()
+    {
+        crate::debug_print!("capture: swap chain changed, device available: {}", device.is_some());
+        if device.is_some() {
+            c.device = device;
+        }
+    }
+}
+
+// caller holds the lock
+fn ensure_shared_tex(c: &mut Capture, w: u32, h: u32, format: u32) {
+    let device_ptr = c.device.as_ref().map_or(0, |device| device.as_raw() as usize);
+    if let Some(_tex) = c.shared_tex.as_ref()
+        && c.tex_device == device_ptr
+        && c.cached_w == w
+        && c.cached_h == h
+        && c.cached_format == format
+    {
+        return;
+    }
+
+    c.release_shared();
+    // the immediate context belongs to a device too
+    if c.tex_device != device_ptr {
+        c.context = None;
+    }
+
+    let Some(device) = c.device.as_ref() else {
+        crate::debug_print!("capture: shared texture creation deferred because no D3D11 device is available");
+        return;
+    };
+
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: w,
+        Height: h,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT(format as i32),
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: (D3D11_RESOURCE_MISC_SHARED.0 | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0) as u32,
+    };
+    let mut tex: Option<ID3D11Texture2D> = None;
+    if unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)) }.is_err() {
+        crate::debug_print!("capture: CreateTexture2D failed");
+        return;
+    }
+    let Some(tex) = tex else {
+        crate::debug_print!("capture: CreateTexture2D succeeded without returning a texture");
+        return;
+    };
+
+    let tex_name = wide(&format!("VoidCaptureTex_{}", c.pid));
+    let res: IDXGIResource1 = match tex.cast() {
+        Ok(r) => r,
+        Err(_error) => {
+            crate::debug_print!("capture: texture cast to IDXGIResource1 failed: {_error}");
+            return;
+        }
+    };
+    match unsafe { res.CreateSharedHandle(None, GENERIC_ALL.0, PCWSTR(tex_name.as_ptr())) } {
+        Ok(h) => {
+            c.shared_handle = Some(h.0 as usize);
+        }
+        Err(_e) => {
+            crate::debug_print!("capture: CreateSharedHandle failed: {_e}");
+            return;
+        }
+    }
+
+    c.shared_tex = Some(tex);
+    c.tex_device = device_ptr;
+    c.cached_w = w;
+    c.cached_h = h;
+    c.cached_format = format;
+
+    crate::debug_print!("capture: shared texture ready {w}x{h}, format {format}");
+
+    unsafe {
+        let info_ptr = INFO_PTR.load(Ordering::Acquire) as *mut VoidCaptureInfo;
+        if !info_ptr.is_null() {
+            std::ptr::addr_of_mut!((*info_ptr).width).write_unaligned(w);
+            std::ptr::addr_of_mut!((*info_ptr).height).write_unaligned(h);
+            std::ptr::addr_of_mut!((*info_ptr).format).write_unaligned(format);
+        }
+    }
+}
+
+pub fn capture_on_present(swapchain: *mut c_void) {
+    let info_ptr = INFO_PTR.load(Ordering::Acquire);
+    if info_ptr == 0 {
+        return;
+    }
+    unsafe {
+        if (*(info_ptr as *const VoidCaptureInfo)).flags & READER_ACTIVE == 0 {
+            return;
+        }
+    }
+
+    if let Ok(mut guard) = CAPTURE.lock() {
+        let Some(c) = guard.as_mut() else { return };
+        if c.last_copy.is_some_and(|at| at.elapsed() < MIN_COPY_INTERVAL) {
+            return;
+        }
+
+        let Some(sc) = (unsafe { IDXGISwapChain1::from_raw_borrowed(&swapchain) }) else {
+            return;
+        };
+        let Ok(back) = (unsafe { sc.GetBuffer::<ID3D11Texture2D>(0) }) else {
+            return;
+        };
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { back.GetDesc(&mut desc) };
+
+        let w = desc.Width;
+        let h = desc.Height;
+        let fmt = desc.Format.0 as u32;
+
+        if c.device.is_none()
+            && let Ok(dev) = unsafe { sc.GetDevice::<ID3D11Device>() }
+        {
+            c.device = Some(dev);
+            c.context = None;
+        }
+
+        ensure_shared_tex(c, w, h, fmt);
+
+        let Some(device) = c.device.as_ref() else { return };
+        let Some(shared) = c.shared_tex.as_ref() else { return };
+        if c.context.is_none()
+            && let Ok(ctx) = unsafe { device.GetImmediateContext() }
+        {
+            c.context = Some(ctx);
+        }
+        let Some(context) = c.context.as_ref() else { return };
+
+        c.last_copy = Some(Instant::now());
+        unsafe { context.CopyResource(shared, &back) };
+
+        unsafe {
+            let info = &mut *(info_ptr as *mut VoidCaptureInfo);
+            info.frame_counter = info.frame_counter.wrapping_add(1);
+            let _ = SetEvent(HANDLE(c.frame_event as *mut _));
+        }
+    }
+}
+
+pub fn capture_cleanup() {
+    crate::debug_print!("capture: cleanup started");
+    if let Ok(mut guard) = CAPTURE.lock() {
+        *guard = None;
+    }
+    INFO_PTR.store(0, Ordering::Release);
+    crate::debug_print!("capture: cleanup completed");
+}

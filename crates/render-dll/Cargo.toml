@@ -1,0 +1,31 @@
+[package]
+name = "render-dll"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "render"
+crate-type = ["cdylib"]
+
+[dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+]}
+minhook = "0.9.*"
+
+[build-dependencies]
+embed-resource = "3.0.*"
+toml = "1.1.*"
+
+[features]
+verbose-logs = []

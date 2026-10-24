@@ -1,0 +1,143 @@
+#![allow(non_camel_case_types, dead_code)]
+
+use windows::{
+    Win32::{
+        Foundation::*,
+        System::{Diagnostics::ToolHelp::*, Memory::*, Threading::*},
+    },
+    core::*,
+};
+
+pub const KUTE_CAPTURE_MAGIC: u32 = 0x5052_4347; // GCRP
+pub const KUTE_CAPTURE_VERSION: u32 = 1;
+pub const READER_ACTIVE: u32 = 0x1;
+const INFO_SIZE: usize = 64;
+const SYNCHRONIZE: u32 = 0x0010_0000;
+
+// must match VoidCaptureInfo in render-dll/src/capture.rs byte for byte
+#[repr(C, packed)]
+pub struct VoidCaptureInfo {
+    pub magic: u32,
+    pub version: u32,
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    pub flags: u32,
+    pub frame_counter: u64,
+    pub reserved: [u64; 2],
+}
+
+pub struct Session {
+    pub pid: u32,
+    pub mapping: HANDLE,
+    pub frame_event: HANDLE,
+    pub view: MEMORY_MAPPED_VIEW_ADDRESS,
+    pub info: *mut VoidCaptureInfo,
+}
+
+impl Session {
+    pub fn close(&mut self) {
+        unsafe {
+            if !self.view.Value.is_null() {
+                let _ = UnmapViewOfFile(self.view);
+            }
+            if !self.mapping.0.is_null() {
+                let _ = CloseHandle(self.mapping);
+            }
+            if !self.frame_event.0.is_null() {
+                let _ = CloseHandle(self.frame_event);
+            }
+        }
+    }
+}
+
+pub fn set_reader_active(s: &Session, on: bool) {
+    unsafe {
+        if !s.info.is_null() {
+            let info = &mut *s.info;
+            if on {
+                info.flags |= READER_ACTIVE;
+            } else {
+                info.flags &= !READER_ACTIVE;
+            }
+        }
+    }
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(Some(0)).collect()
+}
+
+fn name_matches(name: &[u16], expected: &str) -> bool {
+    let exp: Vec<u16> = expected.encode_utf16().collect();
+    if name.len() <= exp.len() {
+        return false;
+    }
+    name[..exp.len()] == exp[..] && name[exp.len()] == 0
+}
+
+fn try_attach(pid: u32) -> Option<Session> {
+    unsafe {
+        let info_name = wide(&format!("VoidCaptureInfo_{pid}"));
+        let mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS.0, false, PCWSTR(info_name.as_ptr())).ok()?;
+        let view = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, INFO_SIZE);
+        if view.Value.is_null() {
+            let _ = CloseHandle(mapping);
+            return None;
+        }
+        let info = view.Value as *mut VoidCaptureInfo;
+        if (*info).magic != KUTE_CAPTURE_MAGIC || (*info).version != KUTE_CAPTURE_VERSION {
+            let _ = UnmapViewOfFile(view);
+            let _ = CloseHandle(mapping);
+            return None;
+        }
+
+        crate::debug_print!("capture: producer discovered (pid {pid})");
+
+        let event_name = wide(&format!("VoidCaptureFrame_{pid}"));
+        let frame_event = OpenEventW(SYNCHRONIZATION_ACCESS_RIGHTS(SYNCHRONIZE), false, PCWSTR(event_name.as_ptr())).unwrap_or_default();
+
+        Some(Session {
+            pid,
+            mapping,
+            frame_event,
+            view,
+            info,
+        })
+    }
+}
+
+pub fn process_exists(pid: u32) -> bool {
+    unsafe {
+        let Ok(h) = OpenProcess(PROCESS_ACCESS_RIGHTS(0), false, pid) else {
+            return false;
+        };
+        let exists = !h.0.is_null();
+        let _ = CloseHandle(h);
+        exists
+    }
+}
+
+pub fn discover() -> Option<Session> {
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut pe: PROCESSENTRY32W = std::mem::zeroed();
+        pe.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+
+        let mut ok = Process32FirstW(snapshot, &mut pe);
+        while ok.is_ok() {
+            if name_matches(&pe.szExeFile, "void.exe")
+                && let Some(s) = try_attach(pe.th32ProcessID)
+            {
+                let _ = CloseHandle(snapshot);
+                return Some(s);
+            }
+
+            // dwSize has to be reset before every call
+            pe.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+            ok = Process32NextW(snapshot, &mut pe);
+        }
+        let _ = CloseHandle(snapshot);
+    }
+    None
+}

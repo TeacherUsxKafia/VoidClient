@@ -1,0 +1,267 @@
+#![allow(non_snake_case, unsafe_op_in_unsafe_fn)]
+
+mod capture;
+mod obsabi;
+
+use obsabi::{OBS, ObsApi, gs_effect_t, gs_texture_t, obs_data_t, obs_source_info, obs_source_t};
+use std::{
+    ffi::{c_char, c_void},
+    sync::atomic::{AtomicI8, Ordering},
+    time::{Duration, Instant},
+};
+use windows::{
+    Win32::{
+        Foundation::GENERIC_ALL,
+        Graphics::Direct3D11::{ID3D11Device, ID3D11Device1, ID3D11Texture2D},
+    },
+    core::{Interface, PCWSTR},
+};
+
+const DISCOVER_RETRY: Duration = Duration::from_millis(500);
+const STALL_RETRY: Duration = Duration::from_secs(1);
+
+static BACKEND_OK: AtomicI8 = AtomicI8::new(-1);
+
+#[macro_export]
+macro_rules! debug_print {
+    ($($arg:tt)*) => {
+        if cfg!(feature = "verbose-logs") {
+            let msg = format!($($arg)*);
+            let wide: Vec<u16> = msg.encode_utf16().chain(Some(0)).collect();
+            #[allow(unused_unsafe)]
+            unsafe {
+                ::windows::Win32::System::Diagnostics::Debug::OutputDebugStringW(
+                    ::windows::core::PCWSTR(wide.as_ptr()),
+                );
+            }
+        }
+    };
+}
+fn backend_supported(api: &ObsApi) -> bool {
+    match BACKEND_OK.load(Ordering::Relaxed) {
+        1 => return true,
+        0 => return false,
+        _ => {}
+    }
+    let ok = unsafe { (api.gs_get_device_type)() } == obsabi::GS_DEVICE_DIRECT3D_11;
+    BACKEND_OK.store(if ok { 1 } else { 0 }, Ordering::Relaxed);
+    if !ok {
+        debug_print!("capture: only D3D11 backend supported");
+    }
+    ok
+}
+
+struct VoidSource {
+    session: Option<capture::Session>,
+    dxgi_tex: Option<ID3D11Texture2D>,
+    gs_tex: *mut gs_texture_t,
+    width: u32,
+    height: u32,
+    last_counter: u64,
+    last_attempt: Instant,
+}
+
+impl VoidSource {
+    fn new() -> Self {
+        Self {
+            session: None,
+            dxgi_tex: None,
+            gs_tex: std::ptr::null_mut(),
+            width: 0,
+            height: 0,
+            last_counter: 0,
+            last_attempt: Instant::now(),
+        }
+    }
+
+    fn teardown_texture(&mut self) {
+        if let Some(api) = OBS.as_ref()
+            && !self.gs_tex.is_null()
+        {
+            unsafe { (api.gs_texture_destroy)(self.gs_tex) };
+            self.gs_tex = std::ptr::null_mut();
+        }
+
+        self.dxgi_tex = None;
+        self.width = 0;
+        self.height = 0;
+    }
+
+    fn open_texture(&mut self, w: u32, h: u32) {
+        if !self.gs_tex.is_null() && self.width == w && self.height == h {
+            return;
+        }
+        self.teardown_texture();
+
+        let Some(api) = OBS.as_ref() else { return };
+        if !backend_supported(api) {
+            return;
+        }
+        let Some(sess) = self.session.as_ref() else { return };
+
+        unsafe {
+            let dev_raw = (api.gs_get_device_obj)();
+            if dev_raw.is_null() {
+                return;
+            }
+            let Some(dev) = ID3D11Device::from_raw_borrowed(&dev_raw) else {
+                return;
+            };
+            // OpenSharedResourceByName needs ID3D11Device1 (11.1+, always there)
+            let Ok(dev1) = dev.cast::<ID3D11Device1>() else { return };
+
+            let name = format!("VoidCaptureTex_{}", sess.pid);
+            let name_w: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            let opened = dev1.OpenSharedResourceByName::<_, ID3D11Texture2D>(PCWSTR(name_w.as_ptr()), GENERIC_ALL.0);
+            drop(dev1);
+
+            let Ok(tex) = opened else {
+                debug_print!("capture: OpenSharedResourceByName failed for {name}");
+                return;
+            };
+            let g = (api.gs_texture_wrap_obj)(Interface::as_raw(&tex));
+            if g.is_null() {
+                return;
+            }
+            self.dxgi_tex = Some(tex); // must outlive gs_tex
+            self.gs_tex = g;
+            self.width = w;
+            self.height = h;
+            debug_print!("capture: opened {name} {w}x{h}");
+        }
+    }
+}
+
+unsafe extern "C" fn get_name(_data: *mut c_void) -> *const c_char {
+    c"Void Client Capture".as_ptr()
+}
+
+unsafe extern "C" fn create(_settings: *mut obs_data_t, _source: *mut obs_source_t) -> *mut c_void {
+    debug_print!("capture: source created");
+    Box::into_raw(Box::new(VoidSource::new())) as *mut c_void
+}
+
+unsafe extern "C" fn destroy(data: *mut c_void) {
+    if data.is_null() {
+        return;
+    }
+    debug_print!("capture: source destroyed");
+    let s = &mut *(data as *mut VoidSource);
+    if let Some(mut sess) = s.session.take() {
+        capture::set_reader_active(&sess, false);
+        debug_print!("capture: reader off (pid {})", sess.pid);
+        sess.close();
+    }
+    s.teardown_texture();
+    drop(Box::from_raw(data as *mut VoidSource));
+}
+
+unsafe extern "C" fn get_width(data: *mut c_void) -> u32 {
+    (*(data as *mut VoidSource)).width
+}
+
+unsafe extern "C" fn get_height(data: *mut c_void) -> u32 {
+    (*(data as *mut VoidSource)).height
+}
+
+unsafe extern "C" fn video_tick(data: *mut c_void, _seconds: f32) {
+    let s = &mut *(data as *mut VoidSource);
+
+    if s.session.is_none() {
+        if s.last_attempt.elapsed() >= DISCOVER_RETRY {
+            s.last_attempt = Instant::now();
+            if let Some(sess) = capture::discover() {
+                capture::set_reader_active(&sess, true);
+                debug_print!("capture: reader on (pid {})", sess.pid);
+                s.session = Some(sess);
+            }
+        }
+        return;
+    }
+
+    let sess = s.session.as_ref().unwrap();
+    let frame_counter = unsafe { (*sess.info).frame_counter };
+
+    if frame_counter == s.last_counter {
+        // no new frame: rediscover if the gpu process died, otherwise keep the last frame
+        if s.last_attempt.elapsed() >= STALL_RETRY && !capture::process_exists(sess.pid) {
+            debug_print!("capture: producer process exited (pid {})", sess.pid);
+            let mut old = s.session.take().unwrap();
+            capture::set_reader_active(&old, false);
+            old.close();
+            s.teardown_texture();
+            s.last_attempt = Instant::now();
+        }
+        return;
+    }
+
+    s.last_counter = frame_counter;
+    s.last_attempt = Instant::now();
+}
+
+unsafe extern "C" fn video_render(data: *mut c_void, effect: *mut gs_effect_t) {
+    let s = &mut *(data as *mut VoidSource);
+
+    if let Some(sess) = s.session.as_ref() {
+        let w = unsafe { (*sess.info).width };
+        let h = unsafe { (*sess.info).height };
+        if w != 0 && h != 0 && (s.gs_tex.is_null() || s.width != w || s.height != h) {
+            s.open_texture(w, h);
+        }
+    }
+
+    if s.gs_tex.is_null() {
+        return;
+    }
+    let Some(api) = OBS.as_ref() else { return };
+    let image = (api.gs_effect_get_param_by_name)(effect, c"image".as_ptr());
+    if image.is_null() {
+        return;
+    }
+    (api.gs_effect_set_texture)(image, s.gs_tex);
+    (api.gs_draw_sprite)(s.gs_tex, 0, s.width, s.height);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn obs_module_load() -> bool {
+    let Some(api) = OBS.as_ref() else {
+        debug_print!("capture: obs.dll API not resolvable");
+        return false;
+    };
+
+    let info = obs_source_info {
+        id: c"void_capture".as_ptr(),
+        source_type: obsabi::OBS_SOURCE_TYPE_INPUT,
+        output_flags: obsabi::OBS_SOURCE_VIDEO,
+        get_name: Some(get_name),
+        create: Some(create),
+        destroy: Some(destroy),
+        get_width: Some(get_width),
+        get_height: Some(get_height),
+        get_defaults: None,
+        get_properties: None,
+        update: None,
+        activate: None,
+        deactivate: None,
+        show: None,
+        hide: None,
+        video_tick: Some(video_tick),
+        video_render: Some(video_render),
+    };
+
+    unsafe {
+        (api.register_source)(&info, std::mem::size_of::<obs_source_info>());
+    }
+    debug_print!("capture: Void Client Capture source registered");
+    true
+}
+
+// required by OBS's loader (OBS_DECLARE_MODULE), unused
+#[unsafe(no_mangle)]
+pub extern "C" fn obs_module_set_pointer(_module: *mut c_void) {}
+
+// OBS only rejects plugins built against a newer libobs, so target 32.0.0
+#[unsafe(no_mangle)]
+pub extern "C" fn obs_module_ver() -> u32 {
+    32 << 24
+}

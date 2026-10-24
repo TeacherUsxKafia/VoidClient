@@ -1,0 +1,44 @@
+{
+    "name": "void",
+    "private": true,
+    "type": "module",
+    "version": "0.1.0",
+    "description": "Void Client, a lightweight Krunker client",
+    "keywords": [
+        "krunker",
+        "krunker-client",
+        "krunkerio",
+        "browser-game",
+        "performance",
+        "fps"
+    ],
+    "author": "TeacherUs",
+    "license": "GPL-3.0-only",
+    "packageManager": "bun@1.4.2",
+    "scripts": {
+        "esbuild": "bun esbuild.config.mjs",
+        "rebrand": "node scripts/rebrand.mjs",
+        "start:dev": "bun run esbuild && cargo build --workspace --features verbose-logs && bun postbuild.js debug && cargo run --features editor-ignore,verbose-logs",
+        "build": "bun run esbuild && cargo build --workspace --release --features packaged,editor-ignore && bun postbuild.js release",
+        "start:prod": "bun run build && ./target/release/void.exe",
+        "portable": "bun run build && node portable.js",
+        "lint": "eslint .",
+        "lint:fix": "eslint . --fix",
+        "typecheck": "tsc -p jsconfig.json && tsc -p src/frontend/jsconfig.json"
+    },
+    "engines": {
+        "bun": ">=1.4.2"
+    },
+    "devDependencies": {
+        "@babel/core": "^8.0.5",
+        "@babel/eslint-parser": "^8.0.5",
+        "@types/bun": "^1.4.2",
+        "@typescript-eslint/eslint-plugin": "^8.70.0",
+        "@typescript-eslint/parser": "^8.70.0",
+        "@typescript/native": "npm:typescript@^7.0.2",
+        "cross-env": "^10.1.0",
+        "esbuild": "^0.28.1",
+        "eslint": "^10.10.0",
+        "typescript": "npm:@typescript/typescript6@^6.0.2"
+    }
+}

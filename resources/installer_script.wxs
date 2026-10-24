@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Id="voidPackage" Name="Void Client" Manufacturer="TeacherUs" Version="1.3.0" Scope="perUser" UpgradeCode="e4b2a9d6-2d5e-4640-97e4-af310132204f">
+    <util:CloseApplication Target="void.exe" CloseMessage="yes" RebootPrompt="no"/>
+    <Icon Id="AppIconIco" SourceFile="resources/void.ico"/>
+    <Property Id="ARPPRODUCTICON" Value="AppIconIco" />
+    <MediaTemplate EmbedCab="yes" />
+    <MajorUpgrade AllowDowngrades="yes" Schedule="afterInstallValidate"/>
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="INSTALLFOLDER" Name="voidClient"/>
+    </StandardDirectory>
+    <Feature Id="ProductFeature" Title="Void Client" Level="1">
+      <ComponentGroupRef Id="RuntimeComponents" />
+      <ComponentGroupRef Id="VoidComponents" />
+    </Feature>
+  </Package>
+  <Fragment>
+    <!-- the CEF runtime, render.dll, the VC runtime and resources/ staged by postbuild.js -->
+    <ComponentGroup Id="RuntimeComponents" Directory="INSTALLFOLDER">
+      <Files Include="..\target\release\dist\**" />
+    </ComponentGroup>
+    <ComponentGroup Id="VoidComponents" Directory="INSTALLFOLDER">
+      <Component Id="MainExecutableComponent" Guid="2a88519e-2100-4593-aeeb-c134303f06d5">
+        <File Id="void.exe" Name="void.exe" Source="target\release\void.exe" KeyPath="yes"/>
+        <File Id="void.pdb" Name ="void.pdb" Source="target\release\void.pdb"/>
+        <Shortcut Id="DesktopShortcut" Directory="DesktopFolder" Name="Void Client" Target="[INSTALLFOLDER]void.exe" WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="ProgramMenuShortcut" Directory="ProgramMenuFolder" Name="Void Client" Target="[INSTALLFOLDER]void.exe" WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFile Id="CleanInstallexe" Name="*.exe" On="uninstall" Directory="INSTALLFOLDER" />
+        <RemoveFile Id="CleanInstalldlls" Name="*.dll" On="uninstall" Directory="INSTALLFOLDER" />
+      </Component>
+      <Component Id="ProtocolRegistrationComponent" Guid="2a7c9079-b4f8-423b-8ef0-c4c1080e8cd0">
+        <RegistryKey Root="HKCU" Key="Software\Classes\voidClient">
+            <RegistryValue Value="URL:voidClient Protocol" Type="string" />
+            <RegistryValue Name="URL Protocol" Value="" Type="string" />
+        </RegistryKey>
+        <RegistryKey Root="HKCU" Key="Software\Classes\voidClient\DefaultIcon">
+            <RegistryValue Value="&quot;[INSTALLFOLDER]void.exe&quot;,0" Type="string" />
+        </RegistryKey>
+        <RegistryKey Root="HKCU" Key="Software\Classes\voidClient\shell\open\command">
+            <RegistryValue Value="&quot;[INSTALLFOLDER]void.exe&quot; &quot;%1&quot;" Type="string" />
+        </RegistryKey>
+      </Component>
+    </ComponentGroup>
+        <CustomAction Id="ExecuteVoid" Impersonate="yes" Return="asyncNoWait" FileRef="void.exe" ExeCommand="" />
+    <InstallExecuteSequence >
+      <Custom Action="ExecuteVoid" After="InstallFinalize" Condition="NOT KUTE_NO_LAUNCH" />
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>

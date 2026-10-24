@@ -1,0 +1,3 @@
+#define RT_MANIFEST 24
+1 RT_MANIFEST "void.exe.manifest"
+100 RT_MANIFEST "comctl6.manifest"

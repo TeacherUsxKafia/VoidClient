@@ -1,0 +1,23 @@
+/*
+ * default.css - built into the client, loaded on every start, on top of Krunker's own styles.
+ *
+ * This file only hides ads, promos and hints. It never touches the logo, a button or match info.
+ *
+ * To preload your own CSS for everyone who uses your build: add rules to this file and rebuild.
+ * To add CSS on your own PC without rebuilding: drop any .css file into
+ *   Documents\<your client name>\css
+ * Those files load after this one, so they win when two rules clash.
+ */
+
+/* ads, promos and hints only, never the logo, a button or match info */
+#tlInfHold,
+#newsHolder,
+#termsInfo,
+#bubbleContainer {
+	display: none !important;
+}
+
+/* krunker's own .popRail.svelte-* rule sets display: block !important */
+body .popRail.popRail {
+	display: none !important;
+}

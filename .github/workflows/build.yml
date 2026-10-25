@@ -1,0 +1,49 @@
+# Builds the client in the cloud, so you do not need Rust, CMake or a fast PC.
+# Use it: GitHub > your repo > Actions > "Build client" > Run workflow. When it is green, open the run and download
+# the "client-portable" file at the bottom (Artifacts). Unzip it, run the .exe.
+name: Build client
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The patched libcef.dll is what fixes the aim freeze, the GPU stutter and the ping spike when you shoot.
+      # It is built by Kute's author (GPL-3.0, patches are in /patches). It must match the CEF version in Cargo.lock
+      # (151.x), so this pins the release the source was taken from. Do not change the tag unless you know why.
+      - name: Get the patched libcef.dll
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download 1.3.0 --repo NullDev/Kute --pattern "*portable*" --dir kute-dl
+          Expand-Archive -Path (Get-ChildItem kute-dl -Filter *.zip).FullName -DestinationPath kute-dl/x
+          $dll = Get-ChildItem kute-dl/x -Recurse -Filter libcef.dll | Select-Object -First 1
+          if (-not $dll) { throw "libcef.dll not found in the Kute release" }
+          New-Item -ItemType Directory -Force resources/cef | Out-Null
+          Copy-Item $dll.FullName resources/cef/libcef.dll
+          Write-Host ("libcef.dll size: " + (Get-Item resources/cef/libcef.dll).Length)
+
+      - run: bun install
+      - run: bun run rebrand
+      - run: bun run build
+      - run: node portable.js
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-portable
+          path: target/*-portable.zip
